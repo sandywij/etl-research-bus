@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import csv
 from datetime import datetime, timedelta
+import zoneinfo
 from queue import Queue
 
 from dotenv import load_dotenv
@@ -165,7 +166,8 @@ class SafeSQLiteResearchETL:
     
     def is_active_hours(self):
         """Check if within active hours"""
-        hour = datetime.now().hour
+        now = datetime.now(zoneinfo.ZoneInfo("Asia/Singapore"))
+        hour = now.hour
         return self.start_hour <= hour < self.end_hour
     
     def should_poll_location(self, location):
