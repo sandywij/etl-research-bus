@@ -489,4 +489,8 @@ if __name__ == "__main__":
     http_thread = threading.Thread(target=start_http_server, args=(pipeline,), daemon=True)
     http_thread.start()
     
+try:
     pipeline.run()
+finally:
+    while True: # Keeps the machine alive so you can check /stats even if ETL fails
+        time.sleep(3600)

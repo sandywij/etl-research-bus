@@ -1,9 +1,6 @@
 app = "research-etl-polling"
 primary_region = "sin"
 
-[build]
-  image = "flyio/builder:latest"
-
 [env]
   TZ = "Asia/Singapore"
   POLL_INTERVAL = "300"
@@ -14,8 +11,26 @@ primary_region = "sin"
   API_TOKEN_HEADER = "AccountKey"
   API_LOCATION_PARAM = "BusStopCode"
 
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # CRITICAL: Keeps the poller running even when no one is accessing the API
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+      grace_period = "10s"
+      interval = "30s"
+      method = "get"
+      path = "/stats"
+      protocol = "http"
+      timeout = "5s"
+
 [[mounts]]
   source = "data"
   destination = "/data"
-  size_gb = 5
+  initial_size = "5gb"
 
+[[vm]]
+  size = "shared-cpu-1x"
