@@ -9,6 +9,9 @@ import csv
 from datetime import datetime, timedelta
 from queue import Queue
 
+from dotenv import load_dotenv
+load_dotenv()
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -27,7 +30,6 @@ def load_locations_from_csv(csv_path):
                 interval = int(row['interval'])
                 priority = row['priority'].strip().lower()
                 
-                # Validate priority
                 if priority not in ['high', 'medium', 'low']:
                     logger.warning(f"Invalid priority '{priority}' for {location}, defaulting to 'medium'")
                     priority = 'medium'
@@ -56,7 +58,6 @@ def load_locations_from_json(json_path):
         with open(json_path, 'r') as f:
             locations_config = json.load(f)
         
-        # Validate structure
         for location, config in locations_config.items():
             if 'interval' not in config or 'priority' not in config:
                 raise ValueError(f"Location {location} missing 'interval' or 'priority'")
@@ -79,7 +80,8 @@ def load_locations_from_json(json_path):
 
 class SafeSQLiteResearchETL:
     def __init__(self, api_url, api_token, locations_config, start_hour=5, end_hour=24, 
-                 db_path='/data/research.db', retention_days=7, token_header='Authorization'):
+                 db_path='/data/research.db', retention_days=7, token_header='AccountKey',
+                 location_param='BusStopCode'):
         self.api_url = api_url
         self.api_token = api_token
         self.locations_config = locations_config
@@ -88,13 +90,13 @@ class SafeSQLiteResearchETL:
         self.db_path = db_path
         self.retention_days = retention_days
         self.token_header = token_header
+        self.location_param = location_param
         
         self.write_queue = Queue(maxsize=1000)
         self.records_processed = 0
         self.last_polls = {}
         self.running = False
         
-        # Build headers with token
         self.headers = {
             'User-Agent': 'Research-ETL-Pipeline/1.0'
         }
@@ -110,7 +112,6 @@ class SafeSQLiteResearchETL:
         conn = sqlite3.connect(self.db_path, timeout=30)
         cursor = conn.cursor()
         
-        # Enable WAL for better concurrency
         cursor.execute('PRAGMA journal_mode=WAL')
         conn.execute('PRAGMA busy_timeout=5000')
         
@@ -163,7 +164,7 @@ class SafeSQLiteResearchETL:
             logger.error(f"Cleanup error: {e}")
     
     def is_active_hours(self):
-        """Check if within active hours (5am-midnight)"""
+        """Check if within active hours"""
         hour = datetime.now().hour
         return self.start_hour <= hour < self.end_hour
     
@@ -190,7 +191,7 @@ class SafeSQLiteResearchETL:
             
             for location in locations_to_poll:
                 try:
-                    params = {'location': location}
+                    params = {self.location_param: location}
                     response = requests.get(
                         self.api_url, 
                         params=params, 
@@ -219,17 +220,16 @@ class SafeSQLiteResearchETL:
                         logger.warning(f"Queue full, dropping {location}")
                     
                 except requests.exceptions.HTTPError as e:
-                    if response.status_code == 401:
+                    if e.response.status_code == 401:
                         logger.error(f"Authentication failed (401) for {location} - check API token")
-                    elif response.status_code == 403:
+                    elif e.response.status_code == 403:
                         logger.error(f"Permission denied (403) for {location} - check API token permissions")
                     else:
-                        logger.warning(f"HTTP error {response.status_code} for {location}: {e}")
+                        logger.warning(f"HTTP error {e.response.status_code} for {location}: {e}")
                 
                 except requests.exceptions.RequestException as e:
                     logger.warning(f"Failed to poll {location}: {e}")
             
-            # Run cleanup every 100 polls
             cleanup_counter += 1
             if cleanup_counter >= 100:
                 self.cleanup_old_data()
@@ -275,7 +275,6 @@ class SafeSQLiteResearchETL:
             
         except sqlite3.OperationalError as e:
             logger.error(f"Database write error: {e}")
-            # Put records back in queue to retry
             for record in batch:
                 try:
                     self.write_queue.put_nowait(record)
@@ -332,7 +331,6 @@ class SafeSQLiteResearchETL:
             cursor.execute('SELECT MAX(sampled_at) FROM samples')
             last_update = cursor.fetchone()[0]
             
-            # Get database file size
             db_size_mb = os.path.getsize(self.db_path) / (1024 * 1024)
             
             conn.close()
@@ -355,9 +353,11 @@ class SafeSQLiteResearchETL:
         """Start both threads"""
         self.running = True
         
-        logger.info("=== Starting Fly.io Research ETL Pipeline ===")
+        logger.info("=== Starting Research ETL Pipeline ===")
         logger.info(f"API URL: {self.api_url}")
+        logger.info(f"Location parameter: {self.location_param}")
         logger.info(f"Token header: {self.token_header}")
+        logger.info(f"Database path: {self.db_path}")
         logger.info(f"Active hours: {self.start_hour}:00-{self.end_hour}:00")
         logger.info(f"Data retention: {self.retention_days} days")
         logger.info("Location config:")
@@ -369,11 +369,8 @@ class SafeSQLiteResearchETL:
             logger.info(f"  {loc} ({config['priority']}): every {config['interval']}s = ~{calls_per_day} calls/day")
         
         logger.info(f"Total estimated daily API calls: {total_daily_calls}")
-        logger.info(f"Estimated daily data: ~{round(total_daily_calls / 1024, 2)}GB")
-        logger.info(f"Estimated storage (with {self.retention_days}-day retention): ~{round((total_daily_calls * self.retention_days) / (1024*1024), 2)}GB")
-        logger.info("=== Pipeline ready ===\n")
+        logger.info(f"=== Pipeline ready ===\n")
         
-        # Start writer thread
         writer_thread = threading.Thread(
             target=self.batch_write_to_db, 
             args=(50,),
@@ -448,13 +445,13 @@ def start_http_server(pipeline):
 if __name__ == "__main__":
     import threading
     
-    # Load configuration from environment variables
     api_url = os.getenv('API_URL')
     api_token = os.getenv('API_TOKEN')
-    token_header = os.getenv('API_TOKEN_HEADER', 'Authorization')
+    token_header = os.getenv('API_TOKEN_HEADER', 'AccountKey')
+    location_param = os.getenv('API_LOCATION_PARAM', 'BusStopCode')
     retention_days = int(os.getenv('DB_RETENTION_DAYS', '7'))
+    db_path = os.getenv('DB_PATH', '/data/research.db')  # /data on Fly.io, override for local
     
-    # Validate required environment variables
     if not api_url:
         logger.error("API_URL environment variable not set")
         exit(1)
@@ -463,7 +460,6 @@ if __name__ == "__main__":
         logger.error("API_TOKEN environment variable not set")
         exit(1)
     
-    # Load locations from file
     locations_file = os.getenv('LOCATIONS_FILE', 'locations.csv')
     
     try:
@@ -485,12 +481,12 @@ if __name__ == "__main__":
         api_token=api_token,
         locations_config=locations_config,
         retention_days=retention_days,
-        token_header=token_header
+        token_header=token_header,
+        location_param=location_param,
+        db_path=db_path
     )
     
-    # Start HTTP server in background
     http_thread = threading.Thread(target=start_http_server, args=(pipeline,), daemon=True)
     http_thread.start()
     
-    # Run ETL
     pipeline.run()

@@ -1,38 +1,21 @@
 app = "research-etl-polling"
-primary_region = "sgp"
+primary_region = "sin"
 
 [build]
-  builder = "paketobuildpacks"
+  image = "flyio/builder:latest"
 
 [env]
-  # These are safe to have in config (non-secret)
   TZ = "Asia/Singapore"
   POLL_INTERVAL = "300"
   START_HOUR = "5"
   END_HOUR = "24"
   DB_RETENTION_DAYS = "7"
   LOCATIONS_FILE = "locations.csv"
-  API_TOKEN_HEADER = "Authorization"
-
-# IMPORTANT: Set API_URL and API_TOKEN via secrets, NOT here
-# See deployment guide for how to set these
-
-[processes]
-  worker = "python pipeline.py"
+  API_TOKEN_HEADER = "AccountKey"
+  API_LOCATION_PARAM = "BusStopCode"
 
 [[mounts]]
   source = "data"
   destination = "/data"
   size_gb = 5
 
-[[services]]
-  internal_port = 8080
-  protocol = "tcp"
-
-  [[services.ports]]
-    handlers = ["http"]
-    port = 80
-
-  [[services.ports]]
-    handlers = ["tls", "http"]
-    port = 443
