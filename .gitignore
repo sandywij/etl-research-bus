@@ -1,0 +1,110 @@
+# Environment variables and secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# API tokens and credentials (should never be committed)
+secrets.txt
+credentials.json
+token.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+.project
+.pydevproject
+.settings/
+
+# Fly.io and deployment
+.fly/
+.flyrc
+fly.dev.toml
+
+# Database files (local testing)
+*.db
+*.sqlite
+*.sqlite3
+research.db
+test_research.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Local data files
+data/
+*.json
+local_exports/
+backup/
+*.csv.bak
+
+# Logs
+*.log
+logs/
+fly.log
+
+# OS specific
+.DS_Store
+Thumbs.db
+.directory
+
+# Build artifacts
+*.tar.gz
+*.zip
+dist/
+build/
+
+# Temporary files
+*.tmp
+*.temp
+*~
+.cache/
+.tmp/
+
+# Project specific
+research.db
+/data
+local_test_output/
+exports/
