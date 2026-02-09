@@ -1,3 +1,5 @@
 location,interval,priority
-85021,60,high
-85019,60,high
+85021,180,high
+85019,180,high
+84479,180,high
+84471,180,high
