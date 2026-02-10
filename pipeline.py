@@ -82,7 +82,7 @@ def load_locations_from_json(json_path):
 class SafeSQLiteResearchETL:
     def __init__(self, api_url, api_token, locations_config, start_hour=5, end_hour=24, 
                  db_path='/data/research.db', retention_days=7, token_header='AccountKey',
-                 location_param='BusStopCode'):
+                 location_param='BusStopCode', stagger_interval=0.5):
         self.api_url = api_url
         self.api_token = api_token
         self.locations_config = locations_config
@@ -92,6 +92,7 @@ class SafeSQLiteResearchETL:
         self.retention_days = retention_days
         self.token_header = token_header
         self.location_param = location_param
+        self.stagger_interval = stagger_interval
         
         self.write_queue = Queue(maxsize=1000)
         self.records_processed = 0
@@ -178,8 +179,9 @@ class SafeSQLiteResearchETL:
         return time_elapsed >= poll_interval
     
     def extract_and_queue(self):
-        """Extract from API and queue for writing"""
+        """Extract from API and queue for writing with staggered requests"""
         cleanup_counter = 0
+        location_list = list(self.locations_config.keys())
         
         while self.running:
             if not self.is_active_hours():
@@ -187,10 +189,14 @@ class SafeSQLiteResearchETL:
                 continue
             
             locations_to_poll = [
-                loc for loc in self.locations_config.keys()
+                loc for loc in location_list
                 if self.should_poll_location(loc)
             ]
             
+            if locations_to_poll:
+                logger.info(f"Polling {len(locations_to_poll)} locations with {self.stagger_interval}s stagger")
+            
+            # Stagger requests to spread API load
             for location in locations_to_poll:
                 try:
                     params = {self.location_param: location}
@@ -221,11 +227,16 @@ class SafeSQLiteResearchETL:
                     except:
                         logger.warning(f"Queue full, dropping {location}")
                     
+                    # Stagger the next request to respect API rate limits
+                    time.sleep(self.stagger_interval)
+                    
                 except requests.exceptions.HTTPError as e:
                     if e.response.status_code == 401:
                         logger.error(f"Authentication failed (401) for {location} - check API token")
                     elif e.response.status_code == 403:
                         logger.error(f"Permission denied (403) for {location} - check API token permissions")
+                    elif e.response.status_code == 429:
+                        logger.warning(f"Rate limited (429) for {location} - increase STAGGER_INTERVAL")
                     else:
                         logger.warning(f"HTTP error {e.response.status_code} for {location}: {e}")
                 
@@ -344,7 +355,8 @@ class SafeSQLiteResearchETL:
                 'queue_size': self.write_queue.qsize(),
                 'records_processed': self.records_processed,
                 'db_size_mb': round(db_size_mb, 2),
-                'retention_days': self.retention_days
+                'retention_days': self.retention_days,
+                'stagger_interval': self.stagger_interval
             }
         
         except sqlite3.OperationalError as e:
@@ -362,15 +374,21 @@ class SafeSQLiteResearchETL:
         logger.info(f"Database path: {self.db_path}")
         logger.info(f"Active hours: {self.start_hour}:00-{self.end_hour}:00")
         logger.info(f"Data retention: {self.retention_days} days")
+        logger.info(f"Stagger interval: {self.stagger_interval}s (rate limiting)")
         logger.info("Location config:")
         
         total_daily_calls = 0
         for loc, config in self.locations_config.items():
             calls_per_day = (19 * 60 * 60) // config['interval']
             total_daily_calls += calls_per_day
-            logger.info(f"  {loc} ({config['priority']}): every {config['interval']}s = ~{calls_per_day} calls/day")
         
+        logger.info(f"Total locations: {len(self.locations_config)}")
         logger.info(f"Total estimated daily API calls: {total_daily_calls}")
+        
+        # Calculate expected requests per second
+        rps = 1 / self.stagger_interval
+        logger.info(f"Requests per second: {rps:.2f}")
+        
         logger.info(f"=== Pipeline ready ===\n")
         
         writer_thread = threading.Thread(
@@ -452,7 +470,8 @@ if __name__ == "__main__":
     token_header = os.getenv('API_TOKEN_HEADER', 'AccountKey')
     location_param = os.getenv('API_LOCATION_PARAM', 'BusStopCode')
     retention_days = int(os.getenv('DB_RETENTION_DAYS', '7'))
-    db_path = os.getenv('DB_PATH', '/data/research.db')  # /data on Fly.io, override for local
+    db_path = os.getenv('DB_PATH', '/data/research.db')
+    stagger_interval = float(os.getenv('STAGGER_INTERVAL', '0.5'))
     
     if not api_url:
         logger.error("API_URL environment variable not set")
@@ -485,14 +504,15 @@ if __name__ == "__main__":
         retention_days=retention_days,
         token_header=token_header,
         location_param=location_param,
-        db_path=db_path
+        db_path=db_path,
+        stagger_interval=stagger_interval
     )
     
     http_thread = threading.Thread(target=start_http_server, args=(pipeline,), daemon=True)
     http_thread.start()
     
-try:
-    pipeline.run()
-finally:
-    while True: # Keeps the machine alive so you can check /stats even if ETL fails
-        time.sleep(3600)
+    try:
+        pipeline.run()
+    finally:
+        while True:  # Keeps the machine alive so you can check /stats
+            time.sleep(3600)
