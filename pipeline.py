@@ -294,7 +294,7 @@ class SafeSQLiteResearchETL:
                 except:
                     pass
     
-    def get_data(self, location=None, limit=100):
+    def get_data(self, location=None, limit=100, offset=0):
         """Query database"""
         try:
             conn = sqlite3.connect(self.db_path, timeout=30)
@@ -307,13 +307,15 @@ class SafeSQLiteResearchETL:
                     WHERE location = ? 
                     ORDER BY sampled_at DESC 
                     LIMIT ?
-                ''', (location, limit))
+                    OFFSET ?
+                ''', (location, limit, offset))
             else:
                 cursor.execute('''
                     SELECT * FROM samples 
                     ORDER BY sampled_at DESC 
                     LIMIT ?
-                ''', (limit,))
+                    OFFSET ?
+                ''', (limit, offset))
             
             rows = cursor.fetchall()
             conn.close()
@@ -425,8 +427,13 @@ def start_http_server(pipeline):
                         limit = int(self.path.split('limit=')[1].split('&')[0])
                     except:
                         pass
+                if 'offset=' in self.path:
+                    try:
+                        offset = int(self.path.split('offset=')[1].split('&')[0])
+                    except:
+                        pass
                 
-                data = pipeline.get_data(location=location, limit=limit)
+                data = pipeline.get_data(location=location, limit=limit, offset=offset)
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
@@ -444,7 +451,7 @@ def start_http_server(pipeline):
                 if 'location=' in self.path:
                     location = self.path.split('location=')[1].split('&')[0]
                 
-                data = pipeline.get_data(location=location, limit=10000)
+                data = pipeline.get_data(location=location, limit=100, offset=0)
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.send_header('Content-Disposition', f'attachment; filename="research_{location or "all"}.json"')
