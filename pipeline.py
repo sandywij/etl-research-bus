@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import csv
 from datetime import datetime, timedelta
+from urllib.parse import urlparse, parse_qs
 import zoneinfo
 from queue import Queue
 
@@ -96,14 +97,17 @@ class SafeSQLiteResearchETL:
         
         self.write_queue = Queue(maxsize=1000)
         self.records_processed = 0
+        self._records_lock = threading.Lock()
         self.last_polls = {}
         self.running = False
         
         self.headers = {
             'User-Agent': 'Research-ETL-Pipeline/1.0'
         }
-        if self.api_token:
-            self.headers[self.token_header] = self.api_token
+        if api_token:
+            self.headers[self.token_header] = api_token
+        # Do not retain the raw token as an instance attribute
+        self.api_token = None
         
         self.setup_database()
     
@@ -209,7 +213,8 @@ class SafeSQLiteResearchETL:
                     response.raise_for_status()
                     
                     data = response.json()
-                    self.records_processed += 1
+                    with self._records_lock:
+                        self.records_processed += 1
                     self.last_polls[location] = datetime.now()
                     
                     priority = self.locations_config[location]['priority']
@@ -224,7 +229,7 @@ class SafeSQLiteResearchETL:
                     try:
                         self.write_queue.put_nowait(record)
                         logger.info(f"Queued {location} ({priority}) - queue: {self.write_queue.qsize()}")
-                    except:
+                    except Exception:
                         logger.warning(f"Queue full, dropping {location}")
                     
                     # Stagger the next request to respect API rate limits
@@ -259,7 +264,7 @@ class SafeSQLiteResearchETL:
                 try:
                     record = self.write_queue.get(timeout=5)
                     batch.append(record)
-                except:
+                except Exception:
                     break
             
             if batch:
@@ -291,32 +296,44 @@ class SafeSQLiteResearchETL:
             for record in batch:
                 try:
                     self.write_queue.put_nowait(record)
-                except:
+                except Exception:
                     pass
     
-    def get_data(self, location=None, limit=100, offset=0):
+    def get_data(self, location=None, limit=100, offset=0, date_from=None, date_to=None):
         """Query database"""
         try:
             conn = sqlite3.connect(self.db_path, timeout=30)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            
+
+            # Build WHERE clause dynamically
+            conditions = []
+            args = []
+
             if location:
-                cursor.execute('''
-                    SELECT * FROM samples 
-                    WHERE location = ? 
-                    ORDER BY sampled_at DESC 
-                    LIMIT ?
-                    OFFSET ?
-                ''', (location, limit, offset))
+                conditions.append('location = ?')
+                args.append(location)
+            if date_from:
+                conditions.append('sampled_at >= ?')
+                args.append(f'{date_from} 00:00:00')
+            if date_to:
+                conditions.append('sampled_at <= ?')
+                args.append(f'{date_to} 23:59:59')
+
+            args += [limit, offset]
+
+            if conditions:
+                where_clause = 'WHERE ' + ' AND '.join(conditions)
             else:
-                cursor.execute('''
-                    SELECT * FROM samples 
-                    ORDER BY sampled_at DESC 
-                    LIMIT ?
-                    OFFSET ?
-                ''', (limit, offset))
-            
+                where_clause = ''
+
+            query = (
+                'SELECT * FROM samples '
+                + where_clause
+                + ' ORDER BY sampled_at DESC LIMIT ? OFFSET ?'
+            )
+            cursor.execute(query, args)
+
             rows = cursor.fetchall()
             conn.close()
             
@@ -336,24 +353,32 @@ class SafeSQLiteResearchETL:
             total = cursor.fetchone()[0]
             
             cursor.execute('''
-                SELECT location, COUNT(*) as count, MAX(sampled_at) as last_sample
+                SELECT location, COUNT(*) as count, MIN(sampled_at) as first_sample, MAX(sampled_at) as last_sample
                 FROM samples 
                 GROUP BY location
             ''')
             
-            by_location = {row[0]: {'count': row[1], 'last_sample': row[2]} for row in cursor.fetchall()}
+            by_location = {
+                row[0]: {
+                    'count': row[1],
+                    'first_sample': row[2],
+                    'last_sample': row[3]
+                }
+                for row in cursor.fetchall()
+            }
             
-            cursor.execute('SELECT MAX(sampled_at) FROM samples')
-            last_update = cursor.fetchone()[0]
+            cursor.execute('SELECT MIN(sampled_at), MAX(sampled_at) FROM samples')
+            first_update, last_update = cursor.fetchone()
             
-            db_size_mb = os.path.getsize(self.db_path) / (1024 * 1024)
+            db_size_mb = os.path.getsize(self.db_path) / (1024 * 1024) if os.path.exists(self.db_path) else 0.0
             
             conn.close()
             
             return {
                 'total_records': total,
                 'by_location': by_location,
-                'last_update': last_update,
+                'first_sampled_at': first_update,
+                'last_sampled_at': last_update,
                 'queue_size': self.write_queue.qsize(),
                 'records_processed': self.records_processed,
                 'db_size_mb': round(db_size_mb, 2),
@@ -411,60 +436,94 @@ class SafeSQLiteResearchETL:
 def start_http_server(pipeline):
     """Expose data via HTTP"""
     from http.server import HTTPServer, BaseHTTPRequestHandler
-    
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            path = self.path.split('?')[0]
-            
+            parsed = urlparse(self.path)
+            path = parsed.path
+            params = parse_qs(parsed.query)
+
+            def get_param(key, default=None, cast=str):
+                val = params.get(key, [None])[0]
+                if val is None:
+                    return default
+                try:
+                    return cast(val)
+                except (ValueError, TypeError):
+                    return default
+
+            def parse_dates():
+                """Parse and validate date_from / date_to query params.
+                Returns (date_from, date_to) on success, or sends a 400
+                and returns None to signal the caller to abort."""
+                date_from = get_param('date_from')
+                date_to   = get_param('date_to')
+                for label, val in [('date_from', date_from), ('date_to', date_to)]:
+                    if val:
+                        try:
+                            datetime.strptime(val, '%Y-%m-%d')
+                        except ValueError:
+                            self.send_response(400)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps(
+                                {'error': f"Invalid {label} '{val}', expected YYYY-MM-DD"}
+                            ).encode())
+                            return None
+                return date_from, date_to
+
+            MAX_LIMIT_DATA   = 10_000
+            MAX_LIMIT_EXPORT = 100_000
+
             if path == '/data':
-                location = None
-                limit = 100
-                
-                if 'location=' in self.path:
-                    location = self.path.split('location=')[1].split('&')[0]
-                if 'limit=' in self.path:
-                    try:
-                        limit = int(self.path.split('limit=')[1].split('&')[0])
-                    except:
-                        pass
-                if 'offset=' in self.path:
-                    try:
-                        offset = int(self.path.split('offset=')[1].split('&')[0])
-                    except:
-                        pass
-                
-                data = pipeline.get_data(location=location, limit=limit, offset=offset)
+                location  = get_param('location')
+                limit     = min(get_param('limit',  100, int), MAX_LIMIT_DATA)
+                offset    = get_param('offset', 0,   int)
+                dates     = parse_dates()
+                if dates is None:
+                    return
+                date_from, date_to = dates
+
+                data = pipeline.get_data(location=location, limit=limit, offset=offset,
+                                         date_from=date_from, date_to=date_to)
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps(data).encode())
-            
+
             elif path == '/stats':
                 stats = pipeline.get_stats()
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps(stats, indent=2).encode())
-            
+
             elif path == '/export':
-                location = None
-                if 'location=' in self.path:
-                    location = self.path.split('location=')[1].split('&')[0]
-                
-                data = pipeline.get_data(location=location, limit=100, offset=0)
+                location  = get_param('location')
+                limit     = min(get_param('limit',  10_000, int), MAX_LIMIT_EXPORT)
+                offset    = get_param('offset', 0,     int)
+                dates     = parse_dates()
+                if dates is None:
+                    return
+                date_from, date_to = dates
+
+                data = pipeline.get_data(location=location, limit=limit, offset=offset,
+                                         date_from=date_from, date_to=date_to)
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
-                self.send_header('Content-Disposition', f'attachment; filename="research_{location or "all"}.json"')
+                import re
+                safe_location = re.sub(r'[^\w\-]', '_', location) if location else 'all'
+                self.send_header('Content-Disposition', f'attachment; filename="research_{safe_location}.json"')
                 self.end_headers()
                 self.wfile.write(json.dumps(data, indent=2).encode())
-            
+
             else:
                 self.send_response(404)
                 self.end_headers()
-        
+
         def log_message(self, format, *args):
             pass
-    
+
     server = HTTPServer(('0.0.0.0', 8080), Handler)
     logger.info("HTTP server started on port 8080")
     server.serve_forever()
