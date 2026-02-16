@@ -99,6 +99,7 @@ class SafeSQLiteResearchETL:
         self.records_processed = 0
         self._records_lock = threading.Lock()
         self.last_polls = {}
+        self.last_cleanup = datetime.now()
         self.running = False
         
         self.headers = {
@@ -184,7 +185,6 @@ class SafeSQLiteResearchETL:
     
     def extract_and_queue(self):
         """Extract from API and queue for writing with staggered requests"""
-        cleanup_counter = 0
         location_list = list(self.locations_config.keys())
         
         while self.running:
@@ -248,10 +248,10 @@ class SafeSQLiteResearchETL:
                 except requests.exceptions.RequestException as e:
                     logger.warning(f"Failed to poll {location}: {e}")
             
-            cleanup_counter += 1
-            if cleanup_counter >= 100:
+            # Time-based cleanup (every hour) instead of counter-based
+            if (datetime.now() - self.last_cleanup).total_seconds() >= 3600:
                 self.cleanup_old_data()
-                cleanup_counter = 0
+                self.last_cleanup = datetime.now()
             
             time.sleep(1)
     
