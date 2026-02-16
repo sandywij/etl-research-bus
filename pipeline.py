@@ -535,7 +535,7 @@ if __name__ == "__main__":
     api_token = os.getenv('API_TOKEN')
     token_header = os.getenv('API_TOKEN_HEADER', 'AccountKey')
     location_param = os.getenv('API_LOCATION_PARAM', 'BusStopCode')
-    retention_days = int(os.getenv('DB_RETENTION_DAYS', '7'))
+    retention_days = int(os.getenv('DB_RETENTION_DAYS', '3'))
     db_path = os.getenv('DB_PATH', '/data/research.db')
     stagger_interval = float(os.getenv('STAGGER_INTERVAL', '0.5'))
     
