@@ -30,7 +30,7 @@ def load_locations_from_csv(csv_path):
             reader = csv.DictReader(f)
             for row in reader:
                 location = row['location'].strip()
-                interval = int(row['interval'])
+                interval = int(row['interval'].strip())  # strip whitespace/\r before casting
                 priority = row['priority'].strip().lower()
 
                 if priority not in ['high', 'medium', 'low']:
@@ -233,7 +233,12 @@ class SafeSQLiteResearchETL:
     # ------------------------------------------------------------------
 
     def is_active_hours(self):
-        """Check if current time is within active hours"""
+        """Check if current time is within active hours in the configured timezone.
+
+        FIX: always use self.timezone (Asia/Singapore), not machine local time.
+        Fly.io machines run UTC by default — without this, start_hour/end_hour
+        are interpreted as UTC and would be wrong by 8 hours for SGT.
+        """
         now = datetime.now(zoneinfo.ZoneInfo(self.timezone))
         return self.start_hour <= now.hour < self.end_hour
 
