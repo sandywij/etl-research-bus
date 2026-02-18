@@ -196,14 +196,14 @@ class SafeSQLiteResearchETL:
             conn = sqlite3.connect(self.db_path, timeout=30)
             cursor = conn.cursor()
 
-            # FIX: store and compare timestamps consistently as UTC ISO strings.
-            # Previously sampled_at was written as a local+offset string
-            # (e.g. "2025-01-01T08:00:00+08:00") but the cutoff comparison
-            # happened against a different format, causing silent mismatches.
-            cutoff = (
-                datetime.now(zoneinfo.ZoneInfo('UTC')) - timedelta(days=self.retention_days)
-            )
-            cutoff_str = cutoff.strftime('%Y-%m-%dT%H:%M:%S+00:00')
+            # FIX: cutoff must use the same timezone as sampled_at.
+            # SQLite compares timestamps as strings lexicographically, so both
+            # sides must use the same offset format (+08:00 for SGT).
+            tz = zoneinfo.ZoneInfo(self.timezone)
+            cutoff = datetime.now(tz) - timedelta(days=self.retention_days)
+            cutoff_str_raw = cutoff.strftime('%Y-%m-%dT%H:%M:%S%z')
+            # %z produces +0800, ISO 8601 needs +08:00
+            cutoff_str = cutoff_str_raw[:-2] + ':' + cutoff_str_raw[-2:]
 
             logger.info(f"Cleanup: removing records before {cutoff_str}")
 
@@ -361,15 +361,19 @@ class SafeSQLiteResearchETL:
 
             priority = self.locations_config[location]['priority']
 
-            # FIX: store sampled_at as UTC ISO string for consistent
-            # comparison in cleanup_old_data
+            # FIX: store sampled_at in configured timezone (SGT) so timestamps
+            # are human-readable in local time without conversion. Use %z to
+            # derive offset from the timezone object, then format as ISO 8601.
+            tz = zoneinfo.ZoneInfo(self.timezone)
+            ts = datetime.now(tz).strftime('%Y-%m-%dT%H:%M:%S%z')
+            # %z produces +0800, ISO 8601 needs +08:00
+            ts_iso = ts[:-2] + ':' + ts[-2:]
+
             record = {
                 'location': location,
                 'priority': priority,
                 'data': json.dumps(data),
-                'sampled_at': datetime.now(zoneinfo.ZoneInfo('UTC')).strftime(
-                    '%Y-%m-%dT%H:%M:%S+00:00'
-                ),
+                'sampled_at': ts_iso,
             }
 
             try:
@@ -503,10 +507,17 @@ class SafeSQLiteResearchETL:
                 args.append(location)
             if date_from:
                 conditions.append('sampled_at >= ?')
-                args.append(f'{date_from}T00:00:00+00:00')
+                # Use %z to get the offset from configured timezone
+                tz = zoneinfo.ZoneInfo(self.timezone)
+                ts = datetime.strptime(f'{date_from}T00:00:00', '%Y-%m-%dT%H:%M:%S').replace(tzinfo=tz)
+                ts_str = ts.strftime('%Y-%m-%dT%H:%M:%S%z')
+                args.append(ts_str[:-2] + ':' + ts_str[-2:])
             if date_to:
                 conditions.append('sampled_at <= ?')
-                args.append(f'{date_to}T23:59:59+00:00')
+                tz = zoneinfo.ZoneInfo(self.timezone)
+                ts = datetime.strptime(f'{date_to}T23:59:59', '%Y-%m-%dT%H:%M:%S').replace(tzinfo=tz)
+                ts_str = ts.strftime('%Y-%m-%dT%H:%M:%S%z')
+                args.append(ts_str[:-2] + ':' + ts_str[-2:])
 
             where = ('WHERE ' + ' AND '.join(conditions)) if conditions else ''
             args += [limit, offset]
