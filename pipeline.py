@@ -292,13 +292,13 @@ class SafeSQLiteResearchETL:
         }
 
         logger.info(
-            f"Poll groups — high: {len(high_group)} locations @ 0.25s stagger, "
+            f"Poll groups — high: {len(high_group)} locations @ 0.15s stagger, "
             f"low/medium: {len(low_group)} locations @ {self.stagger_interval}s stagger"
         )
 
         high_thread = threading.Thread(
             target=self._poll_group,
-            args=(high_group, 0.25),
+            args=(high_group, 0.15),
             name='poller-high',
             daemon=True,
         )
