@@ -6,8 +6,11 @@ import logging
 import sqlite3
 import threading
 import csv
+import queue as queue_module
+import re
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import zoneinfo
 from queue import Queue
 
@@ -21,8 +24,28 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ------------------------------------------------------------------
+# Utility
+# ------------------------------------------------------------------
+
+def _iso8601_tz(ts: str) -> str:
+    """Convert a strftime %z suffix (+0800) to ISO 8601 colon form (+08:00)."""
+    return ts[:-2] + ':' + ts[-2:]
+
+
+def _now_iso(timezone: str) -> str:
+    """Return the current time in the given timezone as an ISO 8601 string."""
+    tz = zoneinfo.ZoneInfo(timezone)
+    ts = datetime.now(tz).strftime('%Y-%m-%dT%H:%M:%S%z')
+    return _iso8601_tz(ts)
+
+
+# ------------------------------------------------------------------
+# Location loaders
+# ------------------------------------------------------------------
+
 def load_locations_from_csv(csv_path):
-    """Load locations configuration from CSV file"""
+    """Load locations configuration from CSV file."""
     locations_config = {}
 
     try:
@@ -30,10 +53,10 @@ def load_locations_from_csv(csv_path):
             reader = csv.DictReader(f)
             for row in reader:
                 location = row['location'].strip()
-                interval = int(row['interval'].strip())  # strip whitespace/\r before casting
+                interval = int(row['interval'].strip())
                 priority = row['priority'].strip().lower()
 
-                if priority not in ['high', 'medium', 'low']:
+                if priority not in ('high', 'medium', 'low'):
                     logger.warning(
                         f"Invalid priority '{priority}' for {location}, defaulting to 'medium'"
                     )
@@ -41,7 +64,7 @@ def load_locations_from_csv(csv_path):
 
                 locations_config[location] = {
                     'interval': interval,
-                    'priority': priority
+                    'priority': priority,
                 }
 
         logger.info(f"Loaded {len(locations_config)} locations from {csv_path}")
@@ -59,7 +82,7 @@ def load_locations_from_csv(csv_path):
 
 
 def load_locations_from_json(json_path):
-    """Load locations configuration from JSON file"""
+    """Load locations configuration from JSON file."""
     try:
         with open(json_path, 'r') as f:
             locations_config = json.load(f)
@@ -75,8 +98,7 @@ def load_locations_from_json(json_path):
                     f"Location {location} interval must be integer (seconds)"
                 )
 
-            # FIX: consistent with CSV loader — warn and default instead of hard raise
-            if config['priority'].lower() not in ['high', 'medium', 'low']:
+            if config['priority'].lower() not in ('high', 'medium', 'low'):
                 logger.warning(
                     f"Invalid priority '{config['priority']}' for {location}, defaulting to 'medium'"
                 )
@@ -92,6 +114,10 @@ def load_locations_from_json(json_path):
         logger.error(f"Invalid JSON in {json_path}: {e}")
         raise
 
+
+# ------------------------------------------------------------------
+# Pipeline
+# ------------------------------------------------------------------
 
 class SafeSQLiteResearchETL:
     def __init__(
@@ -119,14 +145,18 @@ class SafeSQLiteResearchETL:
         self.stagger_interval = stagger_interval
         self.timezone = timezone
 
-        # FIX: queue sized to absorb ~2.5 hrs of backpressure at 18k records/hr
+        # Queue sized to absorb ~2.5 hrs of backpressure at 18k records/hr
         self.write_queue = Queue(maxsize=50_000)
 
-        self.records_processed = 0
+        # FIX: separate counters so operators can distinguish fetch success,
+        # records enqueued, and confirmed DB writes.
+        self._api_fetches = 0
+        self._records_queued = 0
+        self._records_written = 0
         self._records_lock = threading.Lock()
 
-        # FIX: last_polls protected by its own lock — concurrent poll threads
-        # both read and write this dict, so a plain dict is a race condition
+        # last_polls protected by its own lock — concurrent poll threads
+        # both read and write this dict.
         self.last_polls = {}
         self._last_polls_lock = threading.Lock()
 
@@ -141,7 +171,6 @@ class SafeSQLiteResearchETL:
             'User-Agent': 'Research-ETL-Pipeline/1.0',
             token_header: api_token,
         }
-        # Token lives only in headers dict, not as a separate instance attribute
 
         self.setup_database()
 
@@ -150,7 +179,7 @@ class SafeSQLiteResearchETL:
     # ------------------------------------------------------------------
 
     def setup_database(self):
-        """Create database with WAL mode and incremental auto-vacuum"""
+        """Create database with WAL mode and incremental auto-vacuum."""
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
 
         conn = sqlite3.connect(self.db_path, timeout=30)
@@ -158,11 +187,9 @@ class SafeSQLiteResearchETL:
 
         cursor.execute('PRAGMA journal_mode=WAL')
         cursor.execute('PRAGMA busy_timeout=5000')
-
-        # FIX: incremental auto-vacuum instead of manual VACUUM calls.
         # Must be set before any tables are created (or on an empty DB).
-        # This avoids full-DB rewrites that lock reads/writes for seconds
-        # to minutes on a 1.3M-row database.
+        # Avoids full-DB rewrites that lock reads/writes for seconds to
+        # minutes on a large database.
         cursor.execute('PRAGMA auto_vacuum=INCREMENTAL')
 
         cursor.execute('''
@@ -191,19 +218,16 @@ class SafeSQLiteResearchETL:
         logger.info(f"Database initialised at {self.db_path}")
 
     def cleanup_old_data(self):
-        """Delete records older than retention_days, then incrementally reclaim space"""
+        """Delete records older than retention_days, then incrementally reclaim space."""
         try:
             conn = sqlite3.connect(self.db_path, timeout=30)
             cursor = conn.cursor()
 
-            # FIX: cutoff must use the same timezone as sampled_at.
-            # SQLite compares timestamps as strings lexicographically, so both
-            # sides must use the same offset format (+08:00 for SGT).
+            # Cutoff uses the same timezone as sampled_at so SQLite's
+            # lexicographic string comparison is correct.
             tz = zoneinfo.ZoneInfo(self.timezone)
             cutoff = datetime.now(tz) - timedelta(days=self.retention_days)
-            cutoff_str_raw = cutoff.strftime('%Y-%m-%dT%H:%M:%S%z')
-            # %z produces +0800, ISO 8601 needs +08:00
-            cutoff_str = cutoff_str_raw[:-2] + ':' + cutoff_str_raw[-2:]
+            cutoff_str = _iso8601_tz(cutoff.strftime('%Y-%m-%dT%H:%M:%S%z'))
 
             logger.info(f"Cleanup: removing records before {cutoff_str}")
 
@@ -215,8 +239,6 @@ class SafeSQLiteResearchETL:
 
             if deleted > 0:
                 logger.info(f"Deleted {deleted} old records")
-                # FIX: incremental vacuum — frees pages in small batches without
-                # locking the entire database file the way VACUUM does
                 cursor.execute('PRAGMA incremental_vacuum')
                 conn.commit()
                 logger.info("Incremental vacuum complete")
@@ -233,12 +255,7 @@ class SafeSQLiteResearchETL:
     # ------------------------------------------------------------------
 
     def is_active_hours(self):
-        """Check if current time is within active hours in the configured timezone.
-
-        FIX: always use self.timezone (Asia/Singapore), not machine local time.
-        Fly.io machines run UTC by default — without this, start_hour/end_hour
-        are interpreted as UTC and would be wrong by 8 hours for SGT.
-        """
+        """Check if current time is within active hours in the configured timezone."""
         now = datetime.now(zoneinfo.ZoneInfo(self.timezone))
         return self.start_hour <= now.hour < self.end_hour
 
@@ -246,16 +263,14 @@ class SafeSQLiteResearchETL:
         """
         Thread-safe check-and-claim for a location poll slot.
 
-        FIX: the check and the update of last_polls must happen atomically
-        inside the lock. Without this, two concurrent poll threads can both
-        pass the interval check for the same location and fire duplicate
-        requests before either has updated last_polls.
+        The check and the update of last_polls happen atomically inside the
+        lock so two concurrent poll threads cannot both claim the same slot.
         """
         poll_interval = self.locations_config[location]['interval']
         with self._last_polls_lock:
             last_poll = self.last_polls.get(location, datetime.min)
             if (datetime.now() - last_poll).total_seconds() >= poll_interval:
-                self.last_polls[location] = datetime.now()  # claim immediately
+                self.last_polls[location] = datetime.now()
                 return True
             return False
 
@@ -265,21 +280,18 @@ class SafeSQLiteResearchETL:
 
     def extract_and_queue(self):
         """
-        FIX: split locations into two independent polling threads by priority.
+        Split locations into two independent polling threads by priority.
 
-        Original design: single loop sweeping all 2000 locations with 0.5s
-        stagger = 1000s per sweep. 5-minute locations need a poll every 300s,
-        so the single-loop design was structurally unable to meet its own
-        intervals.
-
-        New design:
-          - High-priority (5-min) group: 0.25s stagger → 250s sweep ✓
-          - Low-priority  (10-min) group: 0.5s stagger  → 500s sweep ✓
+        High-priority (5-min) group: 0.1s stagger → ~200s sweep for 2000 locs
+        Low-priority (10-min) group: 0.5s stagger  → ~500s sweep ✓
 
         Each group runs in its own daemon thread so neither blocks the other.
-        The main thread just waits for both to finish (they won't unless
-        self.running is cleared).
         """
+        # FIX: capture stagger in a local variable so the log message and the
+        # thread argument are guaranteed to match.
+        high_stagger = 0.1
+        low_stagger = self.stagger_interval
+
         high_group = {
             loc: cfg
             for loc, cfg in self.locations_config.items()
@@ -292,19 +304,19 @@ class SafeSQLiteResearchETL:
         }
 
         logger.info(
-            f"Poll groups — high: {len(high_group)} locations @ 0.1s stagger, "
-            f"low/medium: {len(low_group)} locations @ {self.stagger_interval}s stagger"
+            f"Poll groups — high: {len(high_group)} locations @ {high_stagger}s stagger, "
+            f"low/medium: {len(low_group)} locations @ {low_stagger}s stagger"
         )
 
         high_thread = threading.Thread(
             target=self._poll_group,
-            args=(high_group, 0.1),
+            args=(high_group, high_stagger),
             name='poller-high',
             daemon=True,
         )
         low_thread = threading.Thread(
             target=self._poll_group,
-            args=(low_group, self.stagger_interval),
+            args=(low_group, low_stagger),
             name='poller-low',
             daemon=True,
         )
@@ -325,7 +337,7 @@ class SafeSQLiteResearchETL:
         low_thread.join()
 
     def _poll_group(self, locations, stagger):
-        """Poll a subset of locations on a fixed stagger interval"""
+        """Poll a subset of locations on a fixed stagger interval."""
         location_list = list(locations.keys())
 
         while self.running:
@@ -333,25 +345,21 @@ class SafeSQLiteResearchETL:
                 time.sleep(60)
                 continue
 
-            # Check and poll each location individually rather than batching
-            # the should_poll_location checks. This ensures the interval timing
-            # is accurate for all locations regardless of where they appear in the list.
             polled_this_cycle = 0
             for location in location_list:
                 if not self.running:
                     break
-                
+
                 if self.should_poll_location(location):
                     self._fetch_and_queue(location)
                     polled_this_cycle += 1
                     time.sleep(stagger)
-            
-            # If no locations were ready, sleep before checking again
+
             if polled_this_cycle == 0:
                 time.sleep(1)
 
     def _fetch_and_queue(self, location):
-        """Fetch one location from the API and push to the write queue"""
+        """Fetch one location from the API and push to the write queue."""
         try:
             response = requests.get(
                 self.api_url,
@@ -363,29 +371,24 @@ class SafeSQLiteResearchETL:
 
             data = response.json()
 
-            with self._records_lock:
-                self.records_processed += 1
-
             priority = self.locations_config[location]['priority']
-
-            # FIX: store sampled_at in configured timezone (SGT) so timestamps
-            # are human-readable in local time without conversion. Use %z to
-            # derive offset from the timezone object, then format as ISO 8601.
-            tz = zoneinfo.ZoneInfo(self.timezone)
-            ts = datetime.now(tz).strftime('%Y-%m-%dT%H:%M:%S%z')
-            # %z produces +0800, ISO 8601 needs +08:00
-            ts_iso = ts[:-2] + ':' + ts[-2:]
+            sampled_at = _now_iso(self.timezone)
 
             record = {
                 'location': location,
                 'priority': priority,
                 'data': json.dumps(data),
-                'sampled_at': ts_iso,
+                'sampled_at': sampled_at,
             }
+
+            with self._records_lock:
+                self._api_fetches += 1
 
             try:
                 self.write_queue.put_nowait(record)
-            except Exception:
+                with self._records_lock:
+                    self._records_queued += 1
+            except queue_module.Full:
                 logger.warning(
                     f"Queue full ({self.write_queue.qsize()}), dropping {location}"
                 )
@@ -407,16 +410,18 @@ class SafeSQLiteResearchETL:
             logger.warning(f"Request failed for {location}: {e}")
 
     # ------------------------------------------------------------------
-    # FIX: rate-limited stats logging
-    # Previously logged queue size on every single insert — at 5 records/sec
-    # that's 18,000 log lines/hour of noise. Now logs a summary every 60s.
+    # Stats logging
     # ------------------------------------------------------------------
 
     def _maybe_log_stats(self):
         now = time.monotonic()
         if now - self._last_stats_log >= self._stats_log_interval:
+            with self._records_lock:
+                fetches = self._api_fetches
+                queued = self._records_queued
+                written = self._records_written
             logger.info(
-                f"[stats] processed={self.records_processed} "
+                f"[stats] api_fetches={fetches} queued={queued} written={written} "
                 f"queue={self.write_queue.qsize()}/{self.write_queue.maxsize}"
             )
             self._last_stats_log = now
@@ -427,25 +432,28 @@ class SafeSQLiteResearchETL:
 
     def batch_write_to_db(self, batch_size=500, max_wait_seconds=2):
         """
-        FIX: dynamic batching — commit when we hit batch_size OR max_wait_seconds,
+        Dynamic batching — commit when we hit batch_size OR max_wait_seconds,
         whichever comes first.
 
-        Original: hardcoded batch of 50 with a 5s timeout, resulting in small
-        commits that don't amortise SQLite's per-commit overhead well at high
-        throughput. New defaults (500 records or 2s) balance latency and
-        write efficiency for 18k records/hr.
+        FIX: the inner loop now catches queue.Empty specifically and continues
+        rather than breaking, so the deadline is actually respected. The
+        original bare `except Exception: break` caused the loop to exit on the
+        first empty get, producing single-record batches at low throughput.
         """
         while self.running or not self.write_queue.empty():
             batch = []
             deadline = time.monotonic() + max_wait_seconds
 
-            while len(batch) < batch_size and time.monotonic() < deadline:
-                try:
-                    record = self.write_queue.get(timeout=0.1)
-                    batch.append(record)
-                except Exception:
-                    # Timeout on get — check deadline and loop
+            while len(batch) < batch_size:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     break
+                try:
+                    record = self.write_queue.get(timeout=min(0.1, remaining))
+                    batch.append(record)
+                except queue_module.Empty:
+                    # No item yet — keep waiting until deadline
+                    continue
 
             if batch:
                 self._write_batch(batch)
@@ -453,7 +461,7 @@ class SafeSQLiteResearchETL:
                 time.sleep(0.5)
 
     def _write_batch(self, batch):
-        """Write a batch of records to SQLite, spilling to overflow on failure"""
+        """Write a batch of records to SQLite, spilling to overflow on failure."""
         try:
             conn = sqlite3.connect(self.db_path, timeout=30)
             cursor = conn.cursor()
@@ -469,6 +477,9 @@ class SafeSQLiteResearchETL:
             conn.commit()
             conn.close()
 
+            with self._records_lock:
+                self._records_written += len(batch)
+
             logger.debug(f"Wrote {len(batch)} records")
 
         except sqlite3.OperationalError as e:
@@ -477,21 +488,17 @@ class SafeSQLiteResearchETL:
 
     def _spill_to_overflow(self, batch):
         """
-        FIX: on DB failure, write undelivered records to a line-delimited JSON
-        file rather than attempting put_nowait into a potentially full queue
-        and silently dropping them.
-
-        A separate replay mechanism (not implemented here) can re-ingest these
-        once the DB recovers.
+        On DB failure, write undelivered records to a line-delimited JSON file
+        rather than dropping them silently or re-queueing into a potentially
+        full queue. A separate replay mechanism can re-ingest these once the
+        DB recovers.
         """
         overflow_path = self.db_path + '.overflow.jsonl'
         try:
             with open(overflow_path, 'a') as f:
                 for record in batch:
                     f.write(json.dumps(record) + '\n')
-            logger.warning(
-                f"Spilled {len(batch)} records to {overflow_path}"
-            )
+            logger.warning(f"Spilled {len(batch)} records to {overflow_path}")
         except OSError as e:
             logger.error(f"Could not write overflow file: {e} — {len(batch)} records lost")
 
@@ -500,7 +507,7 @@ class SafeSQLiteResearchETL:
     # ------------------------------------------------------------------
 
     def get_data(self, location=None, limit=100, offset=0, date_from=None, date_to=None):
-        """Query the samples table with optional filters"""
+        """Query the samples table with optional filters."""
         try:
             conn = sqlite3.connect(self.db_path, timeout=30)
             conn.row_factory = sqlite3.Row
@@ -514,17 +521,14 @@ class SafeSQLiteResearchETL:
                 args.append(location)
             if date_from:
                 conditions.append('sampled_at >= ?')
-                # Use %z to get the offset from configured timezone
                 tz = zoneinfo.ZoneInfo(self.timezone)
                 ts = datetime.strptime(f'{date_from}T00:00:00', '%Y-%m-%dT%H:%M:%S').replace(tzinfo=tz)
-                ts_str = ts.strftime('%Y-%m-%dT%H:%M:%S%z')
-                args.append(ts_str[:-2] + ':' + ts_str[-2:])
+                args.append(_iso8601_tz(ts.strftime('%Y-%m-%dT%H:%M:%S%z')))
             if date_to:
                 conditions.append('sampled_at <= ?')
                 tz = zoneinfo.ZoneInfo(self.timezone)
                 ts = datetime.strptime(f'{date_to}T23:59:59', '%Y-%m-%dT%H:%M:%S').replace(tzinfo=tz)
-                ts_str = ts.strftime('%Y-%m-%dT%H:%M:%S%z')
-                args.append(ts_str[:-2] + ':' + ts_str[-2:])
+                args.append(_iso8601_tz(ts.strftime('%Y-%m-%dT%H:%M:%S%z')))
 
             where = ('WHERE ' + ' AND '.join(conditions)) if conditions else ''
             args += [limit, offset]
@@ -543,7 +547,7 @@ class SafeSQLiteResearchETL:
             return []
 
     def get_stats(self):
-        """Return pipeline and database statistics"""
+        """Return pipeline and database statistics."""
         try:
             conn = sqlite3.connect(self.db_path, timeout=30)
             cursor = conn.cursor()
@@ -553,7 +557,7 @@ class SafeSQLiteResearchETL:
 
             cursor.execute('''
                 SELECT location,
-                       COUNT(*)       AS count,
+                       COUNT(*)        AS count,
                        MIN(sampled_at) AS first_sample,
                        MAX(sampled_at) AS last_sample
                 FROM samples
@@ -579,6 +583,11 @@ class SafeSQLiteResearchETL:
 
             conn.close()
 
+            with self._records_lock:
+                api_fetches = self._api_fetches
+                records_queued = self._records_queued
+                records_written = self._records_written
+
             return {
                 'total_records': total,
                 'by_location': by_location,
@@ -586,7 +595,11 @@ class SafeSQLiteResearchETL:
                 'last_sampled_at': last_update,
                 'queue_size': self.write_queue.qsize(),
                 'queue_max': self.write_queue.maxsize,
-                'records_processed': self.records_processed,
+                # FIX: expose all three counters so operators can see the full
+                # fetch → queue → write funnel and spot where records are lost.
+                'api_fetches': api_fetches,
+                'records_queued': records_queued,
+                'records_written': records_written,
                 'db_size_mb': round(db_size_mb, 2),
                 'retention_days': self.retention_days,
                 'stagger_interval': self.stagger_interval,
@@ -601,7 +614,7 @@ class SafeSQLiteResearchETL:
     # ------------------------------------------------------------------
 
     def run(self):
-        """Start writer thread then run the extract loop"""
+        """Start writer thread then run the extract loop."""
         self.running = True
 
         logger.info("=== Starting Research ETL Pipeline ===")
@@ -627,7 +640,7 @@ class SafeSQLiteResearchETL:
             target=self.batch_write_to_db,
             kwargs={'batch_size': 500, 'max_wait_seconds': 2},
             name='writer',
-            daemon=False,   # keep alive until queue drains on shutdown
+            daemon=False,  # keep alive until queue drains on shutdown
         )
         writer_thread.start()
 
@@ -638,23 +651,42 @@ class SafeSQLiteResearchETL:
         except Exception as e:
             logger.error(f"Unexpected error in extract loop: {e}", exc_info=True)
         finally:
-            # FIX: always clear running so the writer thread can exit cleanly,
-            # even if an unexpected exception escapes extract_and_queue
             self.running = False
-            logger.info("Waiting for writer thread to flush remaining records...")
+            # FIX: log queue depth before joining so operators know whether
+            # the 30s timeout is likely to be sufficient.
+            remaining = self.write_queue.qsize()
+            if remaining:
+                logger.info(
+                    f"Waiting for writer thread to flush {remaining} remaining records "
+                    f"(timeout=30s)..."
+                )
+            else:
+                logger.info("Queue empty — waiting for writer thread to exit...")
             writer_thread.join(timeout=30)
-            logger.info("Shutdown complete")
+            if writer_thread.is_alive():
+                logger.warning(
+                    "Writer thread did not finish within 30s — some records may not have been written. "
+                    "Check the overflow file."
+                )
+            else:
+                logger.info("Shutdown complete")
 
 
 # ------------------------------------------------------------------
 # HTTP server
 # ------------------------------------------------------------------
 
+# FIX: _SAFE_LOCATION_RE caps location string length and restricts chars to
+# avoid unbounded strings reaching SQLite (no injection risk due to
+# parameterised queries, but good defence-in-depth and log hygiene).
+_SAFE_LOCATION_RE = re.compile(r'^[\w\-]{1,64}$')
+
+# Sentinel to distinguish "param absent" from "param present but bad cast"
+_MISSING = object()
+
+
 def start_http_server(pipeline):
-    """Expose pipeline data via a simple HTTP API"""
-    # FIX: ThreadingHTTPServer so a slow /export query doesn't block /stats
-    from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-    import re
+    """Expose pipeline data via a simple HTTP API."""
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -662,29 +694,48 @@ def start_http_server(pipeline):
             path = parsed.path
             params = parse_qs(parsed.query)
 
-            def get_param(key, default=None, cast=str):
-                val = params.get(key, [None])[0]
-                if val is None:
+            def get_param(key, default=_MISSING, cast=str):
+                """
+                Return the first value for key, cast to type, or default.
+
+                FIX: uses a sentinel (_MISSING) to distinguish "key absent"
+                from "key present but bad cast", eliminating the previous
+                None-ambiguity that made callers fragile.
+
+                Returns (_MISSING, None) if the key is absent and no default
+                was supplied, or (None, error_response_already_sent) on bad
+                cast.
+                """
+                raw = params.get(key, [None])[0]
+                if raw is None:
                     return default
                 try:
-                    return cast(val)
+                    return cast(raw)
                 except (ValueError, TypeError):
-                    # FIX: return 400 on bad cast rather than silently using default
                     self._send_json(
-                        {'error': f"Invalid value for '{key}': '{val}'"},
+                        {'error': f"Invalid value for '{key}': '{raw}'"},
                         status=400,
                     )
-                    return None
+                    return _MISSING  # signals "400 already sent"
+
+            def require_param(key, cast=str, default=_MISSING):
+                """Wrapper that returns (value, ok) so callers can early-exit cleanly."""
+                val = get_param(key, default=default, cast=cast)
+                if val is _MISSING:
+                    return None, False
+                return val, True
 
             def parse_dates():
-                date_from = get_param('date_from')
-                date_to = get_param('date_to')
-                if date_from is None and 'date_from' in params:
-                    return None   # bad cast already sent 400
-                if date_to is None and 'date_to' in params:
+                """Parse date_from / date_to, returning (date_from, date_to) or None on error."""
+                date_from, ok = require_param('date_from', default=None)
+                if not ok:
                     return None
-                for label, val in [('date_from', date_from), ('date_to', date_to)]:
-                    if val:
+                date_to, ok = require_param('date_to', default=None)
+                if not ok:
+                    return None
+
+                for label, val in (('date_from', date_from), ('date_to', date_to)):
+                    if val is not None:
                         try:
                             datetime.strptime(val, '%Y-%m-%d')
                         except ValueError:
@@ -694,6 +745,21 @@ def start_http_server(pipeline):
                             )
                             return None
                 return date_from, date_to
+
+            def validate_location(raw):
+                """
+                FIX: validate location param length and character set.
+                Returns the location string or None (400 already sent).
+                """
+                if raw is None:
+                    return None, True  # absent is fine — means "all locations"
+                if not _SAFE_LOCATION_RE.match(raw):
+                    self._send_json(
+                        {'error': f"Invalid location '{raw}': must be 1–64 word characters or hyphens"},
+                        status=400,
+                    )
+                    return None, False
+                return raw, True
 
             def send_data(data, filename=None):
                 body = json.dumps(data, indent=2 if filename else None).encode()
@@ -710,13 +776,18 @@ def start_http_server(pipeline):
             MAX_LIMIT_EXPORT = 100_000
 
             if path == '/data':
-                location = get_param('location')
-                limit_raw = get_param('limit', 100, int)
-                if limit_raw is None:
+                raw_loc, ok = require_param('location', default=None)
+                if not ok:
+                    return
+                location, ok = validate_location(raw_loc)
+                if not ok:
+                    return
+                limit_raw, ok = require_param('limit', cast=int, default=100)
+                if not ok:
                     return
                 limit = min(limit_raw, MAX_LIMIT_DATA)
-                offset_raw = get_param('offset', 0, int)
-                if offset_raw is None:
+                offset, ok = require_param('offset', cast=int, default=0)
+                if not ok:
                     return
                 dates = parse_dates()
                 if dates is None:
@@ -724,7 +795,7 @@ def start_http_server(pipeline):
                 date_from, date_to = dates
 
                 data = pipeline.get_data(
-                    location=location, limit=limit, offset=offset_raw,
+                    location=location, limit=limit, offset=offset,
                     date_from=date_from, date_to=date_to,
                 )
                 send_data(data)
@@ -733,13 +804,18 @@ def start_http_server(pipeline):
                 send_data(pipeline.get_stats())
 
             elif path == '/export':
-                location = get_param('location')
-                limit_raw = get_param('limit', 10_000, int)
-                if limit_raw is None:
+                raw_loc, ok = require_param('location', default=None)
+                if not ok:
+                    return
+                location, ok = validate_location(raw_loc)
+                if not ok:
+                    return
+                limit_raw, ok = require_param('limit', cast=int, default=10_000)
+                if not ok:
                     return
                 limit = min(limit_raw, MAX_LIMIT_EXPORT)
-                offset_raw = get_param('offset', 0, int)
-                if offset_raw is None:
+                offset, ok = require_param('offset', cast=int, default=0)
+                if not ok:
                     return
                 dates = parse_dates()
                 if dates is None:
@@ -747,7 +823,7 @@ def start_http_server(pipeline):
                 date_from, date_to = dates
 
                 data = pipeline.get_data(
-                    location=location, limit=limit, offset=offset_raw,
+                    location=location, limit=limit, offset=offset,
                     date_from=date_from, date_to=date_to,
                 )
                 safe_loc = re.sub(r'[^\w\-]', '_', location) if location else 'all'
@@ -828,5 +904,3 @@ if __name__ == "__main__":
     http_thread.start()
 
     pipeline.run()
-    # No infinite loop needed — pipeline.run() only returns after clean shutdown.
-    # The HTTP server is daemon=True so it exits with the process.
