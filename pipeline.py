@@ -292,13 +292,13 @@ class SafeSQLiteResearchETL:
         }
 
         logger.info(
-            f"Poll groups — high: {len(high_group)} locations @ 0.15s stagger, "
+            f"Poll groups — high: {len(high_group)} locations @ 0.1s stagger, "
             f"low/medium: {len(low_group)} locations @ {self.stagger_interval}s stagger"
         )
 
         high_thread = threading.Thread(
             target=self._poll_group,
-            args=(high_group, 0.15),
+            args=(high_group, 0.1),
             name='poller-high',
             daemon=True,
         )
@@ -333,15 +333,22 @@ class SafeSQLiteResearchETL:
                 time.sleep(60)
                 continue
 
-            to_poll = [loc for loc in location_list if self.should_poll_location(loc)]
-
-            for location in to_poll:
+            # Check and poll each location individually rather than batching
+            # the should_poll_location checks. This ensures the interval timing
+            # is accurate for all locations regardless of where they appear in the list.
+            polled_this_cycle = 0
+            for location in location_list:
                 if not self.running:
                     break
-                self._fetch_and_queue(location)
-                time.sleep(stagger)
-
-            time.sleep(1)
+                
+                if self.should_poll_location(location):
+                    self._fetch_and_queue(location)
+                    polled_this_cycle += 1
+                    time.sleep(stagger)
+            
+            # If no locations were ready, sleep before checking again
+            if polled_this_cycle == 0:
+                time.sleep(1)
 
     def _fetch_and_queue(self, location):
         """Fetch one location from the API and push to the write queue"""
