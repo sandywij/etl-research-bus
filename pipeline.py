@@ -6,6 +6,7 @@ import logging
 import sqlite3
 import threading
 import csv
+import heapq
 import queue as queue_module
 import re
 from datetime import datetime, timedelta
@@ -155,11 +156,6 @@ class SafeSQLiteResearchETL:
         self._records_written = 0
         self._records_lock = threading.Lock()
 
-        # last_polls protected by its own lock — concurrent poll threads
-        # both read and write this dict.
-        self.last_polls = {}
-        self._last_polls_lock = threading.Lock()
-
         self.last_cleanup = datetime.now()
         self.running = False
 
@@ -259,20 +255,32 @@ class SafeSQLiteResearchETL:
         now = datetime.now(zoneinfo.ZoneInfo(self.timezone))
         return self.start_hour <= now.hour < self.end_hour
 
-    def should_poll_location(self, location):
+    def _build_schedule_heap(self, locations: dict) -> list:
         """
-        Thread-safe check-and-claim for a location poll slot.
+        Build an initial min-heap of (next_poll_monotonic, location) entries.
 
-        The check and the update of last_polls happen atomically inside the
-        lock so two concurrent poll threads cannot both claim the same slot.
+        Locations are staggered across their interval on startup so the first
+        sweep doesn't fire all requests simultaneously. For example, 600 high-
+        priority locations with a 300s interval are spread evenly over 0–300s.
+
+        We use time.monotonic() as the heap key — it's immune to clock
+        adjustments and never goes backwards, which matters for a sleep-based
+        scheduler.
         """
-        poll_interval = self.locations_config[location]['interval']
-        with self._last_polls_lock:
-            last_poll = self.last_polls.get(location, datetime.min)
-            if (datetime.now() - last_poll).total_seconds() >= poll_interval:
-                self.last_polls[location] = datetime.now()
-                return True
-            return False
+        heap = []
+        location_list = list(locations.keys())
+        n = len(location_list)
+
+        for i, location in enumerate(location_list):
+            interval = self.locations_config[location]['interval']
+            # Spread first polls evenly across one full interval window.
+            # min(..., interval) ensures the offset never exceeds the interval
+            # even for tiny groups.
+            offset = (i / max(n, 1)) * interval
+            next_poll = time.monotonic() + offset
+            heapq.heappush(heap, (next_poll, location))
+
+        return heap
 
     # ------------------------------------------------------------------
     # Polling — separate threads per priority group
@@ -282,13 +290,12 @@ class SafeSQLiteResearchETL:
         """
         Split locations into two independent polling threads by priority.
 
-        High-priority (5-min) group: 0.1s stagger → ~200s sweep for 2000 locs
-        Low-priority (10-min) group: 0.5s stagger  → ~500s sweep ✓
-
-        Each group runs in its own daemon thread so neither blocks the other.
+        Each thread runs a heap-based scheduler: it sleeps precisely until the
+        next location is due, fetches it, then re-schedules it at
+        now + interval. This replaces the old loop-and-check approach, which
+        wasted CPU spinning over locations that weren't ready and could drift
+        significantly under load.
         """
-        # FIX: capture stagger in a local variable so the log message and the
-        # thread argument are guaranteed to match.
         high_stagger = 0.1
         low_stagger = self.stagger_interval
 
@@ -304,8 +311,8 @@ class SafeSQLiteResearchETL:
         }
 
         logger.info(
-            f"Poll groups — high: {len(high_group)} locations @ {high_stagger}s stagger, "
-            f"low/medium: {len(low_group)} locations @ {low_stagger}s stagger"
+            f"Poll groups — high: {len(high_group)} locations, "
+            f"low/medium: {len(low_group)} locations"
         )
 
         high_thread = threading.Thread(
@@ -336,27 +343,76 @@ class SafeSQLiteResearchETL:
         high_thread.join()
         low_thread.join()
 
-    def _poll_group(self, locations, stagger):
-        """Poll a subset of locations on a fixed stagger interval."""
-        location_list = list(locations.keys())
+    def _poll_group(self, locations: dict, stagger: float):
+        """
+        Drive a group of locations using a min-heap priority queue keyed on
+        next_poll_monotonic time.
+
+        Algorithm per iteration:
+          1. Peek at the soonest-due location (heap[0]).
+          2. If it's not due yet, sleep until it is (with a 60s cap so we
+             can re-check is_active_hours and self.running promptly).
+          3. Pop it, fetch it, then push (now + interval + stagger) back onto
+             the heap so the next poll is scheduled immediately.
+
+        The stagger is added to next_poll (not just applied as a sleep after
+        fetch) so it accumulates into the schedule and prevents bursts from
+        re-synchronising over time.
+
+        Inactive-hours behaviour: when outside active hours the thread sleeps
+        in 60s increments. When active hours resume all locations are
+        rescheduled from now so we don't fire a backlog of overdue polls.
+        """
+        if not locations:
+            logger.info(f"[{threading.current_thread().name}] No locations assigned, exiting.")
+            return
+
+        heap = self._build_schedule_heap(locations)
+        was_inactive = False
 
         while self.running:
             if not self.is_active_hours():
+                if not was_inactive:
+                    logger.info(
+                        f"[{threading.current_thread().name}] Outside active hours — pausing"
+                    )
+                    was_inactive = True
                 time.sleep(60)
                 continue
 
-            polled_this_cycle = 0
-            for location in location_list:
-                if not self.running:
-                    break
+            if was_inactive:
+                # Resuming after inactive period — reschedule everything from
+                # now so we don't immediately fire hundreds of overdue polls.
+                logger.info(
+                    f"[{threading.current_thread().name}] Active hours resumed — "
+                    f"rescheduling {len(heap)} locations from now"
+                )
+                heap = self._build_schedule_heap(locations)
+                was_inactive = False
 
-                if self.should_poll_location(location):
-                    self._fetch_and_queue(location)
-                    polled_this_cycle += 1
-                    time.sleep(stagger)
+            # Peek at the soonest-due entry
+            next_poll, location = heap[0]
+            now = time.monotonic()
+            wait = next_poll - now
 
-            if polled_this_cycle == 0:
-                time.sleep(1)
+            if wait > 0:
+                # Sleep until due, but cap at 60s so we can react to shutdown
+                # or active-hours transitions promptly.
+                time.sleep(min(wait, 60))
+                continue
+
+            # Pop and fetch
+            heapq.heappop(heap)
+            self._fetch_and_queue(location)
+
+            # Reschedule: base the next poll on the *intended* fire time, not
+            # wall clock, so drift from a slow fetch doesn't compound.
+            # However if we're already more than one interval late (e.g. after
+            # a long HTTP timeout), clamp to now to avoid an immediate re-fire.
+            interval = self.locations_config[location]['interval']
+            ideal_next = next_poll + interval + stagger
+            clamped_next = max(ideal_next, time.monotonic())
+            heapq.heappush(heap, (clamped_next, location))
 
     def _fetch_and_queue(self, location):
         """Fetch one location from the API and push to the write queue."""
