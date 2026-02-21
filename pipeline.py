@@ -562,31 +562,36 @@ class SafeSQLiteResearchETL:
     # Query interface
     # ------------------------------------------------------------------
 
+    def _build_query(self, location, date_from, date_to):
+        """Build the WHERE clause and args list shared by get_data and iter_data."""
+        conditions = []
+        args = []
+
+        if location:
+            conditions.append('location = ?')
+            args.append(location)
+        if date_from:
+            conditions.append('sampled_at >= ?')
+            tz = zoneinfo.ZoneInfo(self.timezone)
+            ts = datetime.strptime(f'{date_from}T00:00:00', '%Y-%m-%dT%H:%M:%S').replace(tzinfo=tz)
+            args.append(_iso8601_tz(ts.strftime('%Y-%m-%dT%H:%M:%S%z')))
+        if date_to:
+            conditions.append('sampled_at <= ?')
+            tz = zoneinfo.ZoneInfo(self.timezone)
+            ts = datetime.strptime(f'{date_to}T23:59:59', '%Y-%m-%dT%H:%M:%S').replace(tzinfo=tz)
+            args.append(_iso8601_tz(ts.strftime('%Y-%m-%dT%H:%M:%S%z')))
+
+        where = ('WHERE ' + ' AND '.join(conditions)) if conditions else ''
+        return where, args
+
     def get_data(self, location=None, limit=100, offset=0, date_from=None, date_to=None):
-        """Query the samples table with optional filters."""
+        """Query the samples table with optional filters. Returns a list (for small /data requests)."""
         try:
-            conn = sqlite3.connect(self.db_path, timeout=30)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
 
-            conditions = []
-            args = []
-
-            if location:
-                conditions.append('location = ?')
-                args.append(location)
-            if date_from:
-                conditions.append('sampled_at >= ?')
-                tz = zoneinfo.ZoneInfo(self.timezone)
-                ts = datetime.strptime(f'{date_from}T00:00:00', '%Y-%m-%dT%H:%M:%S').replace(tzinfo=tz)
-                args.append(_iso8601_tz(ts.strftime('%Y-%m-%dT%H:%M:%S%z')))
-            if date_to:
-                conditions.append('sampled_at <= ?')
-                tz = zoneinfo.ZoneInfo(self.timezone)
-                ts = datetime.strptime(f'{date_to}T23:59:59', '%Y-%m-%dT%H:%M:%S').replace(tzinfo=tz)
-                args.append(_iso8601_tz(ts.strftime('%Y-%m-%dT%H:%M:%S%z')))
-
-            where = ('WHERE ' + ' AND '.join(conditions)) if conditions else ''
+            where, args = self._build_query(location, date_from, date_to)
             args += [limit, offset]
 
             cursor.execute(
@@ -601,6 +606,43 @@ class SafeSQLiteResearchETL:
         except sqlite3.OperationalError as e:
             logger.error(f"DB read error: {e}")
             return []
+
+    def iter_data(self, location=None, limit=100_000, offset=0, date_from=None, date_to=None, chunk_size=500):
+        """
+        Generator that yields rows one dict at a time, fetching in chunks of
+        chunk_size to avoid loading the full result set into memory.
+
+        Used by the /export endpoint to stream large responses without OOM risk.
+        The connection is always closed via try/finally even if the caller breaks
+        out of the generator early.
+        """
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=60)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.arraysize = chunk_size
+
+            where, args = self._build_query(location, date_from, date_to)
+            args += [limit, offset]
+
+            cursor.execute(
+                f'SELECT * FROM samples {where} ORDER BY sampled_at DESC LIMIT ? OFFSET ?',
+                args,
+            )
+
+            while True:
+                chunk = cursor.fetchmany()
+                if not chunk:
+                    break
+                for row in chunk:
+                    yield dict(row)
+
+        except sqlite3.OperationalError as e:
+            logger.error(f"DB read error during export: {e}")
+        finally:
+            if conn:
+                conn.close()
 
     def get_stats(self):
         """Return pipeline and database statistics."""
@@ -821,12 +863,48 @@ def start_http_server(pipeline):
                 body = json.dumps(data, indent=2 if filename else None).encode()
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
                 if filename:
                     self.send_header(
                         'Content-Disposition', f'attachment; filename="{filename}"'
                     )
                 self.end_headers()
                 self.wfile.write(body)
+
+            def stream_export(row_iter, filename):
+                """
+                Stream a JSON array to the client one row at a time, so we
+                never hold the full result set in memory.
+
+                Uses chunked Transfer-Encoding so we don't need to know the
+                total size up front. Writes valid JSON: opening '[', one
+                serialised dict per row separated by commas, then closing ']'.
+                """
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Transfer-Encoding', 'chunked')
+                self.send_header(
+                    'Content-Disposition', f'attachment; filename="{filename}"'
+                )
+                self.end_headers()
+
+                def write_chunk(s: str):
+                    data = s.encode()
+                    # Chunked encoding: hex length, CRLF, data, CRLF
+                    self.wfile.write(f'{len(data):X}\r\n'.encode())
+                    self.wfile.write(data)
+                    self.wfile.write(b'\r\n')
+
+                first = True
+                write_chunk('[')
+                for row in row_iter:
+                    if not first:
+                        write_chunk(',')
+                    write_chunk(json.dumps(row))
+                    first = False
+                write_chunk(']')
+                # Terminating chunk
+                self.wfile.write(b'0\r\n\r\n')
 
             MAX_LIMIT_DATA = 10_000
             MAX_LIMIT_EXPORT = 100_000
@@ -878,12 +956,12 @@ def start_http_server(pipeline):
                     return
                 date_from, date_to = dates
 
-                data = pipeline.get_data(
+                safe_loc = re.sub(r'[^\w\-]', '_', location) if location else 'all'
+                row_iter = pipeline.iter_data(
                     location=location, limit=limit, offset=offset,
                     date_from=date_from, date_to=date_to,
                 )
-                safe_loc = re.sub(r'[^\w\-]', '_', location) if location else 'all'
-                send_data(data, filename=f"research_{safe_loc}.json")
+                stream_export(row_iter, filename=f"research_{safe_loc}.json")
 
             else:
                 self.send_response(404)
@@ -895,6 +973,13 @@ def start_http_server(pipeline):
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(encoded)
+
+        def handle_one_request(self):
+            """Override to swallow BrokenPipeError from clients that disconnect mid-response."""
+            try:
+                super().handle_one_request()
+            except BrokenPipeError:
+                pass  # client closed the connection before we finished writing — harmless
 
         def log_message(self, format, *args):
             pass  # suppress default per-request stderr logging
