@@ -1,36 +1,49 @@
-app = "research-etl-polling"
-primary_region = "sin"
+# fly.toml app configuration file generated for research-etl-polling on 2026-02-17T16:49:10+08:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'research-etl-polling'
+primary_region = 'sin'
+
+[build]
 
 [env]
-  TZ = "Asia/Singapore"
-  POLL_INTERVAL = "300"
-  START_HOUR = "5"
-  END_HOUR = "24"
-  DB_RETENTION_DAYS = "3"
-  LOCATIONS_FILE = "locations.csv"
-  API_TOKEN_HEADER = "AccountKey"
-  API_LOCATION_PARAM = "BusStopCode"
+  API_LOCATION_PARAM = 'BusStopCode'
+  API_TOKEN_HEADER = 'AccountKey'
+  DB_RETENTION_DAYS = '3'
+  END_HOUR = '24'
+  LOCATIONS_FILE = 'locations.csv'
+  POLL_INTERVAL = '300'
+  START_HOUR = '5'
+  TZ = 'Asia/Singapore'
+
+[deploy]
+  strategy = "immediate"
+
+[[mounts]]
+  source = 'data'
+  destination = '/data'
+  initial_size = '5gb'
 
 [http_service]
   internal_port = 8080
   force_https = true
-  # CRITICAL: Keeps the poller running even when no one is accessing the API
-  auto_stop_machines = false
+  auto_stop_machines = 'off'
   auto_start_machines = true
   min_machines_running = 1
+  
+  [http_service.concurrency]
+    hard_limit = 25
+    soft_limit = 20
 
   [[http_service.checks]]
-      grace_period = "10s"
-      interval = "30s"
-      method = "get"
-      path = "/stats"
-      protocol = "http"
-      timeout = "5s"
-
-[[mounts]]
-  source = "data"
-  destination = "/data"
-  initial_size = "5gb"
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '20s'
+    method = 'get'
+    path = '/health'
+    protocol = 'http'
 
 [[vm]]
-  size = "shared-cpu-1x"
+  size = 'shared-cpu-1x'
