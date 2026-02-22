@@ -612,15 +612,25 @@ class SafeSQLiteResearchETL:
         Generator that yields rows one dict at a time, fetching in chunks of
         chunk_size to avoid loading the full result set into memory.
 
-        Used by the /export endpoint to stream large responses without OOM risk.
-        The connection is always closed via try/finally even if the caller breaks
-        out of the generator early.
+        Opens the DB in read-only URI mode so it never blocks on the WAL writer.
+        Uses mmap and a generous cache to keep the scan fast on a small VM.
         """
         conn = None
         try:
-            conn = sqlite3.connect(self.db_path, timeout=60)
+            # URI mode with ?mode=ro — reads never block writes and vice versa
+            uri = f'file:{self.db_path}?mode=ro'
+            conn = sqlite3.connect(uri, uri=True, timeout=60)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
+
+            # Tune for a sequential read-heavy export on a low-RAM machine:
+            # - mmap_size: let SQLite read directly from mapped memory (256MB)
+            # - cache_size: keep more index/data pages in memory (-32000 = 32MB)
+            # - temp_store: keep any sort temp tables in memory not on disk
+            cursor.execute('PRAGMA mmap_size=268435456')
+            cursor.execute('PRAGMA cache_size=-32000')
+            cursor.execute('PRAGMA temp_store=MEMORY')
+
             cursor.arraysize = chunk_size
 
             where, args = self._build_query(location, date_from, date_to)
@@ -873,43 +883,40 @@ def start_http_server(pipeline):
 
             def stream_export(row_iter, filename):
                 """
-                Stream a JSON array to the client one row at a time, so we
-                never hold the full result set in memory.
+                Stream a JSON array to the client row by row.
 
-                Uses chunked Transfer-Encoding so we don't need to know the
-                total size up front. Writes valid JSON: opening '[', one
-                serialised dict per row separated by commas, then closing ']'.
+                Does NOT use chunked Transfer-Encoding — Fly's Envoy proxy
+                handles its own framing and rejects chunked from the backend.
+                Instead we write directly and flush every 100 rows so the
+                proxy sees activity and doesn't treat the connection as idle.
                 """
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
-                self.send_header('Transfer-Encoding', 'chunked')
-                self.send_header(
-                    'Content-Disposition', f'attachment; filename="{filename}"'
-                )
+                self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
                 self.end_headers()
 
-                def write_chunk(s: str):
-                    data = s.encode()
-                    # Chunked encoding: hex length, CRLF, data, CRLF
-                    self.wfile.write(f'{len(data):X}\r\n'.encode())
-                    self.wfile.write(data)
-                    self.wfile.write(b'\r\n')
-
                 first = True
-                write_chunk('[')
+                row_count = 0
+                self.wfile.write(b'[')
                 for row in row_iter:
                     if not first:
-                        write_chunk(',')
-                    write_chunk(json.dumps(row))
+                        self.wfile.write(b',')
+                    self.wfile.write(json.dumps(row).encode())
                     first = False
-                write_chunk(']')
-                # Terminating chunk
-                self.wfile.write(b'0\r\n\r\n')
+                    row_count += 1
+                    if row_count % 100 == 0:
+                        self.wfile.flush()
+                self.wfile.write(b']')
+                self.wfile.flush()
+                logger.info(f"Export complete: {row_count} rows streamed for {filename}")
 
             MAX_LIMIT_DATA = 10_000
             MAX_LIMIT_EXPORT = 100_000
 
-            if path == '/data':
+            if path == '/health':
+                send_data({'status': 'ok', 'running': pipeline.running})
+
+            elif path == '/data':
                 raw_loc, ok = require_param('location', default=None)
                 if not ok:
                     return
