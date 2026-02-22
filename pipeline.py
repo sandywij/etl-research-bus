@@ -883,32 +883,41 @@ def start_http_server(pipeline):
 
             def stream_export(row_iter, filename):
                 """
-                Stream a JSON array to the client row by row.
-
-                Does NOT use chunked Transfer-Encoding — Fly's Envoy proxy
-                handles its own framing and rejects chunked from the backend.
-                Instead we write directly and flush every 100 rows so the
-                proxy sees activity and doesn't treat the connection as idle.
+                Stream a JSON array in batches of 500 rows per write.
+                Batching reduces syscalls and JSON serialisation overhead
+                significantly vs writing one row at a time.
                 """
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
                 self.end_headers()
 
-                first = True
+                BATCH = 500
                 row_count = 0
-                self.wfile.write(b'[')
+                first_batch = True
+                batch = []
+
+                def flush_batch(batch, first_batch):
+                    prefix = b'[' if first_batch else b','
+                    self.wfile.write(prefix + b','.join(
+                        json.dumps(r).encode() for r in batch
+                    ))
+                    self.wfile.flush()
+
                 for row in row_iter:
-                    if not first:
-                        self.wfile.write(b',')
-                    self.wfile.write(json.dumps(row).encode())
-                    first = False
+                    batch.append(row)
                     row_count += 1
-                    if row_count % 100 == 0:
-                        self.wfile.flush()
+                    if len(batch) >= BATCH:
+                        flush_batch(batch, first_batch)
+                        first_batch = False
+                        batch = []
+
+                if batch:
+                    flush_batch(batch, first_batch)
+
                 self.wfile.write(b']')
                 self.wfile.flush()
-                logger.info(f"Export complete: {row_count} rows streamed for {filename}")
+                logger.info(f"Export complete: {row_count} rows for {filename}")
 
             MAX_LIMIT_DATA = 10_000
             MAX_LIMIT_EXPORT = 100_000
