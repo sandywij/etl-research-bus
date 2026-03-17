@@ -1,4 +1,4 @@
-BusStopCode,interval,priority
+location,interval,priority
 1012,300,high
 1013,300,high
 1019,300,high

@@ -146,11 +146,10 @@ class SafeSQLiteResearchETL:
         self.stagger_interval = stagger_interval
         self.timezone = timezone
 
-        # Queue sized to absorb ~2.5 hrs of backpressure at 18k records/hr
-        self.write_queue = Queue(maxsize=50_000)
+        # FIX (scale): bumped from 50k to 100k to maintain ~2hr buffer at
+        # 12.5 records/sec (5000 locations).
+        self.write_queue = Queue(maxsize=100_000)
 
-        # FIX: separate counters so operators can distinguish fetch success,
-        # records enqueued, and confirmed DB writes.
         self._api_fetches = 0
         self._records_queued = 0
         self._records_written = 0
@@ -159,7 +158,6 @@ class SafeSQLiteResearchETL:
         self.last_cleanup = datetime.now()
         self.running = False
 
-        # Rate-limited stats logging
         self._last_stats_log = time.monotonic()
         self._stats_log_interval = 60  # seconds
 
@@ -183,9 +181,6 @@ class SafeSQLiteResearchETL:
 
         cursor.execute('PRAGMA journal_mode=WAL')
         cursor.execute('PRAGMA busy_timeout=5000')
-        # Must be set before any tables are created (or on an empty DB).
-        # Avoids full-DB rewrites that lock reads/writes for seconds to
-        # minutes on a large database.
         cursor.execute('PRAGMA auto_vacuum=INCREMENTAL')
 
         cursor.execute('''
@@ -219,8 +214,6 @@ class SafeSQLiteResearchETL:
             conn = sqlite3.connect(self.db_path, timeout=30)
             cursor = conn.cursor()
 
-            # Cutoff uses the same timezone as sampled_at so SQLite's
-            # lexicographic string comparison is correct.
             tz = zoneinfo.ZoneInfo(self.timezone)
             cutoff = datetime.now(tz) - timedelta(days=self.retention_days)
             cutoff_str = _iso8601_tz(cutoff.strftime('%Y-%m-%dT%H:%M:%S%z'))
@@ -259,13 +252,9 @@ class SafeSQLiteResearchETL:
         """
         Build an initial min-heap of (next_poll_monotonic, location) entries.
 
-        Locations are staggered across their interval on startup so the first
-        sweep doesn't fire all requests simultaneously. For example, 600 high-
-        priority locations with a 300s interval are spread evenly over 0–300s.
-
-        We use time.monotonic() as the heap key — it's immune to clock
-        adjustments and never goes backwards, which matters for a sleep-based
-        scheduler.
+        Locations are staggered evenly across one full interval window so
+        startup doesn't fire all requests simultaneously. Uses time.monotonic()
+        as the key — immune to clock adjustments and never goes backwards.
         """
         heap = []
         location_list = list(locations.keys())
@@ -273,9 +262,6 @@ class SafeSQLiteResearchETL:
 
         for i, location in enumerate(location_list):
             interval = self.locations_config[location]['interval']
-            # Spread first polls evenly across one full interval window.
-            # min(..., interval) ensures the offset never exceeds the interval
-            # even for tiny groups.
             offset = (i / max(n, 1)) * interval
             next_poll = time.monotonic() + offset
             heapq.heappush(heap, (next_poll, location))
@@ -289,14 +275,12 @@ class SafeSQLiteResearchETL:
     def extract_and_queue(self):
         """
         Split locations into two independent polling threads by priority.
-
-        Each thread runs a heap-based scheduler: it sleeps precisely until the
-        next location is due, fetches it, then re-schedules it at
-        now + interval. This replaces the old loop-and-check approach, which
-        wasted CPU spinning over locations that weren't ready and could drift
-        significantly under load.
+        Each thread runs a heap-based scheduler for accurate interval timing.
         """
-        high_stagger = 0.1
+        # FIX (scale): reduced high stagger from 0.1s to 0.05s to give the
+        # high poller more headroom at 2,500 locations (ceiling ~20/sec vs
+        # required ~8.3/sec). Configurable via env var for further tuning.
+        high_stagger = float(os.getenv('HIGH_STAGGER', '0.05'))
         low_stagger = self.stagger_interval
 
         high_group = {
@@ -311,8 +295,8 @@ class SafeSQLiteResearchETL:
         }
 
         logger.info(
-            f"Poll groups — high: {len(high_group)} locations, "
-            f"low/medium: {len(low_group)} locations"
+            f"Poll groups — high: {len(high_group)} locations @ {high_stagger}s stagger, "
+            f"low/medium: {len(low_group)} locations @ {low_stagger}s stagger"
         )
 
         high_thread = threading.Thread(
@@ -331,7 +315,6 @@ class SafeSQLiteResearchETL:
         high_thread.start()
         low_thread.start()
 
-        # Periodic cleanup (hourly) and stats logging on the main extract thread
         while self.running:
             if (datetime.now() - self.last_cleanup).total_seconds() >= 3600:
                 self.cleanup_old_data()
@@ -348,20 +331,8 @@ class SafeSQLiteResearchETL:
         Drive a group of locations using a min-heap priority queue keyed on
         next_poll_monotonic time.
 
-        Algorithm per iteration:
-          1. Peek at the soonest-due location (heap[0]).
-          2. If it's not due yet, sleep until it is (with a 60s cap so we
-             can re-check is_active_hours and self.running promptly).
-          3. Pop it, fetch it, then push (now + interval + stagger) back onto
-             the heap so the next poll is scheduled immediately.
-
-        The stagger is added to next_poll (not just applied as a sleep after
-        fetch) so it accumulates into the schedule and prevents bursts from
-        re-synchronising over time.
-
-        Inactive-hours behaviour: when outside active hours the thread sleeps
-        in 60s increments. When active hours resume all locations are
-        rescheduled from now so we don't fire a backlog of overdue polls.
+        Inactive-hours behaviour: sleeps in 60s increments, then rebuilds
+        the heap on resume to avoid firing a backlog of overdue polls.
         """
         if not locations:
             logger.info(f"[{threading.current_thread().name}] No locations assigned, exiting.")
@@ -381,8 +352,6 @@ class SafeSQLiteResearchETL:
                 continue
 
             if was_inactive:
-                # Resuming after inactive period — reschedule everything from
-                # now so we don't immediately fire hundreds of overdue polls.
                 logger.info(
                     f"[{threading.current_thread().name}] Active hours resumed — "
                     f"rescheduling {len(heap)} locations from now"
@@ -390,25 +359,17 @@ class SafeSQLiteResearchETL:
                 heap = self._build_schedule_heap(locations)
                 was_inactive = False
 
-            # Peek at the soonest-due entry
             next_poll, location = heap[0]
             now = time.monotonic()
             wait = next_poll - now
 
             if wait > 0:
-                # Sleep until due, but cap at 60s so we can react to shutdown
-                # or active-hours transitions promptly.
                 time.sleep(min(wait, 60))
                 continue
 
-            # Pop and fetch
             heapq.heappop(heap)
             self._fetch_and_queue(location)
 
-            # Reschedule: base the next poll on the *intended* fire time, not
-            # wall clock, so drift from a slow fetch doesn't compound.
-            # However if we're already more than one interval late (e.g. after
-            # a long HTTP timeout), clamp to now to avoid an immediate re-fire.
             interval = self.locations_config[location]['interval']
             ideal_next = next_poll + interval + stagger
             clamped_next = max(ideal_next, time.monotonic())
@@ -426,7 +387,6 @@ class SafeSQLiteResearchETL:
             response.raise_for_status()
 
             data = response.json()
-
             priority = self.locations_config[location]['priority']
             sampled_at = _now_iso(self.timezone)
 
@@ -486,15 +446,14 @@ class SafeSQLiteResearchETL:
     # Writer thread
     # ------------------------------------------------------------------
 
-    def batch_write_to_db(self, batch_size=500, max_wait_seconds=2):
+    def batch_write_to_db(self, batch_size=1000, max_wait_seconds=5):
         """
-        Dynamic batching — commit when we hit batch_size OR max_wait_seconds,
-        whichever comes first.
+        Dynamic batching — commit when we hit batch_size OR max_wait_seconds.
 
-        FIX: the inner loop now catches queue.Empty specifically and continues
-        rather than breaking, so the deadline is actually respected. The
-        original bare `except Exception: break` caused the loop to exit on the
-        first empty get, producing single-record batches at low throughput.
+        FIX (scale): defaults raised from (500, 2s) to (1000, 5s). At 12.5
+        rec/sec the old defaults produced ~25 records per commit (always hitting
+        the time trigger). New defaults yield batches of ~60 records at steady
+        state — still well within latency budget and ~2.5x fewer commits/min.
         """
         while self.running or not self.write_queue.empty():
             batch = []
@@ -508,7 +467,6 @@ class SafeSQLiteResearchETL:
                     record = self.write_queue.get(timeout=min(0.1, remaining))
                     batch.append(record)
                 except queue_module.Empty:
-                    # No item yet — keep waiting until deadline
                     continue
 
             if batch:
@@ -543,12 +501,7 @@ class SafeSQLiteResearchETL:
             self._spill_to_overflow(batch)
 
     def _spill_to_overflow(self, batch):
-        """
-        On DB failure, write undelivered records to a line-delimited JSON file
-        rather than dropping them silently or re-queueing into a potentially
-        full queue. A separate replay mechanism can re-ingest these once the
-        DB recovers.
-        """
+        """On DB failure, write undelivered records to a line-delimited JSON file."""
         overflow_path = self.db_path + '.overflow.jsonl'
         try:
             with open(overflow_path, 'a') as f:
@@ -609,28 +562,19 @@ class SafeSQLiteResearchETL:
 
     def iter_data(self, location=None, limit=100_000, offset=0, date_from=None, date_to=None, chunk_size=500):
         """
-        Generator that yields rows one dict at a time, fetching in chunks of
-        chunk_size to avoid loading the full result set into memory.
-
-        Opens the DB in read-only URI mode so it never blocks on the WAL writer.
-        Uses mmap and a generous cache to keep the scan fast on a small VM.
+        Generator that yields rows one dict at a time, fetching in chunks.
+        Opens DB in read-only URI mode so reads never block the WAL writer.
+        Connection is always closed via try/finally even if caller breaks early.
         """
         conn = None
         try:
-            # URI mode with ?mode=ro — reads never block writes and vice versa
             uri = f'file:{self.db_path}?mode=ro'
             conn = sqlite3.connect(uri, uri=True, timeout=60)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-
-            # Tune for a sequential read-heavy export on a low-RAM machine:
-            # - mmap_size: let SQLite read directly from mapped memory (256MB)
-            # - cache_size: keep more index/data pages in memory (-32000 = 32MB)
-            # - temp_store: keep any sort temp tables in memory not on disk
             cursor.execute('PRAGMA mmap_size=268435456')
             cursor.execute('PRAGMA cache_size=-32000')
             cursor.execute('PRAGMA temp_store=MEMORY')
-
             cursor.arraysize = chunk_size
 
             where, args = self._build_query(location, date_from, date_to)
@@ -655,7 +599,14 @@ class SafeSQLiteResearchETL:
                 conn.close()
 
     def get_stats(self):
-        """Return pipeline and database statistics."""
+        """
+        Return pipeline and database statistics.
+
+        FIX (scale): by_location GROUP BY removed from the default response —
+        at 2.5M rows steady state it scans the full table and takes several
+        seconds, holding a read lock during active writes. Use /stats/locations
+        for per-location detail when needed.
+        """
         try:
             conn = sqlite3.connect(self.db_path, timeout=30)
             cursor = conn.cursor()
@@ -663,25 +614,11 @@ class SafeSQLiteResearchETL:
             cursor.execute('SELECT COUNT(*) FROM samples')
             total = cursor.fetchone()[0]
 
-            cursor.execute('''
-                SELECT location,
-                       COUNT(*)        AS count,
-                       MIN(sampled_at) AS first_sample,
-                       MAX(sampled_at) AS last_sample
-                FROM samples
-                GROUP BY location
-            ''')
-            by_location = {
-                row[0]: {
-                    'count': row[1],
-                    'first_sample': row[2],
-                    'last_sample': row[3],
-                }
-                for row in cursor.fetchall()
-            }
-
             cursor.execute('SELECT MIN(sampled_at), MAX(sampled_at) FROM samples')
             first_update, last_update = cursor.fetchone()
+
+            cursor.execute('SELECT COUNT(DISTINCT location) FROM samples')
+            location_count = cursor.fetchone()[0]
 
             db_size_mb = (
                 os.path.getsize(self.db_path) / (1024 * 1024)
@@ -698,13 +635,11 @@ class SafeSQLiteResearchETL:
 
             return {
                 'total_records': total,
-                'by_location': by_location,
+                'distinct_locations': location_count,
                 'first_sampled_at': first_update,
                 'last_sampled_at': last_update,
                 'queue_size': self.write_queue.qsize(),
                 'queue_max': self.write_queue.maxsize,
-                # FIX: expose all three counters so operators can see the full
-                # fetch → queue → write funnel and spot where records are lost.
                 'api_fetches': api_fetches,
                 'records_queued': records_queued,
                 'records_written': records_written,
@@ -715,6 +650,42 @@ class SafeSQLiteResearchETL:
 
         except sqlite3.OperationalError as e:
             logger.error(f"DB stats error: {e}")
+            return {}
+
+    def get_location_stats(self):
+        """
+        Return per-location record counts and sample times.
+        Separated from get_stats because the GROUP BY is expensive at scale
+        (~2.5M rows, 5000 locations). Call via /stats/locations only when needed.
+        """
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=60)
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                SELECT location,
+                       COUNT(*)        AS count,
+                       MIN(sampled_at) AS first_sample,
+                       MAX(sampled_at) AS last_sample
+                FROM samples
+                GROUP BY location
+                ORDER BY location
+            ''')
+
+            result = {
+                row[0]: {
+                    'count': row[1],
+                    'first_sample': row[2],
+                    'last_sample': row[3],
+                }
+                for row in cursor.fetchall()
+            }
+
+            conn.close()
+            return result
+
+        except sqlite3.OperationalError as e:
+            logger.error(f"DB location stats error: {e}")
             return {}
 
     # ------------------------------------------------------------------
@@ -744,11 +715,13 @@ class SafeSQLiteResearchETL:
         logger.info(f"Est. daily API calls: {total_daily:,}")
         logger.info("=== Pipeline ready ===\n")
 
+        # FIX (scale): batch_size and max_wait_seconds raised to match 5k
+        # location throughput — see batch_write_to_db docstring.
         writer_thread = threading.Thread(
             target=self.batch_write_to_db,
-            kwargs={'batch_size': 500, 'max_wait_seconds': 2},
+            kwargs={'batch_size': 1000, 'max_wait_seconds': 5},
             name='writer',
-            daemon=False,  # keep alive until queue drains on shutdown
+            daemon=False,
         )
         writer_thread.start()
 
@@ -760,8 +733,6 @@ class SafeSQLiteResearchETL:
             logger.error(f"Unexpected error in extract loop: {e}", exc_info=True)
         finally:
             self.running = False
-            # FIX: log queue depth before joining so operators know whether
-            # the 30s timeout is likely to be sufficient.
             remaining = self.write_queue.qsize()
             if remaining:
                 logger.info(
@@ -784,12 +755,7 @@ class SafeSQLiteResearchETL:
 # HTTP server
 # ------------------------------------------------------------------
 
-# FIX: _SAFE_LOCATION_RE caps location string length and restricts chars to
-# avoid unbounded strings reaching SQLite (no injection risk due to
-# parameterised queries, but good defence-in-depth and log hygiene).
 _SAFE_LOCATION_RE = re.compile(r'^[\w\-]{1,64}$')
-
-# Sentinel to distinguish "param absent" from "param present but bad cast"
 _MISSING = object()
 
 
@@ -803,17 +769,6 @@ def start_http_server(pipeline):
             params = parse_qs(parsed.query)
 
             def get_param(key, default=_MISSING, cast=str):
-                """
-                Return the first value for key, cast to type, or default.
-
-                FIX: uses a sentinel (_MISSING) to distinguish "key absent"
-                from "key present but bad cast", eliminating the previous
-                None-ambiguity that made callers fragile.
-
-                Returns (_MISSING, None) if the key is absent and no default
-                was supplied, or (None, error_response_already_sent) on bad
-                cast.
-                """
                 raw = params.get(key, [None])[0]
                 if raw is None:
                     return default
@@ -824,17 +779,15 @@ def start_http_server(pipeline):
                         {'error': f"Invalid value for '{key}': '{raw}'"},
                         status=400,
                     )
-                    return _MISSING  # signals "400 already sent"
+                    return _MISSING
 
             def require_param(key, cast=str, default=_MISSING):
-                """Wrapper that returns (value, ok) so callers can early-exit cleanly."""
                 val = get_param(key, default=default, cast=cast)
                 if val is _MISSING:
                     return None, False
                 return val, True
 
             def parse_dates():
-                """Parse date_from / date_to, returning (date_from, date_to) or None on error."""
                 date_from, ok = require_param('date_from', default=None)
                 if not ok:
                     return None
@@ -855,12 +808,8 @@ def start_http_server(pipeline):
                 return date_from, date_to
 
             def validate_location(raw):
-                """
-                FIX: validate location param length and character set.
-                Returns the location string or None (400 already sent).
-                """
                 if raw is None:
-                    return None, True  # absent is fine — means "all locations"
+                    return None, True
                 if not _SAFE_LOCATION_RE.match(raw):
                     self._send_json(
                         {'error': f"Invalid location '{raw}': must be 1–64 word characters or hyphens"},
@@ -883,41 +832,71 @@ def start_http_server(pipeline):
 
             def stream_export(row_iter, filename):
                 """
-                Stream a JSON array in batches of 500 rows per write.
-                Batching reduces syscalls and JSON serialisation overhead
-                significantly vs writing one row at a time.
+                Stream a JSON array to the client in batches of 500 rows per
+                write to reduce syscalls.
+
+                FIX: correctly handles empty results (writes '[]' not just ']').
+                FIX: explicit try/finally ensures the iter_data DB connection is
+                closed immediately if the client disconnects mid-stream, rather
+                than waiting for garbage collection.
                 """
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
-                self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+                self.send_header('Transfer-Encoding', 'chunked')
+                self.send_header(
+                    'Content-Disposition', f'attachment; filename="{filename}"'
+                )
                 self.end_headers()
+
+                def write_chunk(data: bytes):
+                    self.wfile.write(f'{len(data):X}\r\n'.encode())
+                    self.wfile.write(data)
+                    self.wfile.write(b'\r\n')
 
                 BATCH = 500
                 row_count = 0
-                first_batch = True
+                first = True
                 batch = []
 
-                def flush_batch(batch, first_batch):
-                    prefix = b'[' if first_batch else b','
-                    self.wfile.write(prefix + b','.join(
+                def flush(batch, first):
+                    # First batch opens the array; subsequent batches add a
+                    # comma separator before the first element of the batch.
+                    prefix = b'[' if first else b','
+                    write_chunk(prefix + b','.join(
                         json.dumps(r).encode() for r in batch
                     ))
-                    self.wfile.flush()
 
-                for row in row_iter:
-                    batch.append(row)
-                    row_count += 1
-                    if len(batch) >= BATCH:
-                        flush_batch(batch, first_batch)
-                        first_batch = False
-                        batch = []
+                try:
+                    for row in row_iter:
+                        batch.append(row)
+                        row_count += 1
+                        if len(batch) >= BATCH:
+                            flush(batch, first)
+                            first = False
+                            batch = []
 
-                if batch:
-                    flush_batch(batch, first_batch)
+                    # Flush any remaining rows
+                    if batch:
+                        flush(batch, first)
+                        first = False
 
-                self.wfile.write(b']')
-                self.wfile.flush()
-                logger.info(f"Export complete: {row_count} rows for {filename}")
+                    # FIX: if no rows were yielded at all, first is still True
+                    # and we must open the array ourselves before closing it.
+                    if first:
+                        write_chunk(b'[')
+
+                    write_chunk(b']')
+                    # Chunked transfer terminator
+                    self.wfile.write(b'0\r\n\r\n')
+
+                finally:
+                    # Ensure the generator's DB connection is closed even if
+                    # the client disconnects and BrokenPipeError is raised.
+                    # Exhausting or closing the generator triggers iter_data's
+                    # try/finally which closes the SQLite connection.
+                    row_iter.close()
+
+                logger.info(f"Export complete: {row_count} rows → {filename}")
 
             MAX_LIMIT_DATA = 10_000
             MAX_LIMIT_EXPORT = 100_000
@@ -952,6 +931,11 @@ def start_http_server(pipeline):
 
             elif path == '/stats':
                 send_data(pipeline.get_stats())
+
+            elif path == '/stats/locations':
+                # FIX (scale): expensive GROUP BY query separated from /stats
+                # so the fast summary endpoint isn't affected.
+                send_data(pipeline.get_location_stats())
 
             elif path == '/export':
                 raw_loc, ok = require_param('location', default=None)
@@ -991,14 +975,14 @@ def start_http_server(pipeline):
             self.wfile.write(encoded)
 
         def handle_one_request(self):
-            """Override to swallow BrokenPipeError from clients that disconnect mid-response."""
+            """Swallow BrokenPipeError from clients that disconnect mid-response."""
             try:
                 super().handle_one_request()
             except BrokenPipeError:
-                pass  # client closed the connection before we finished writing — harmless
+                pass
 
         def log_message(self, format, *args):
-            pass  # suppress default per-request stderr logging
+            pass
 
     server = ThreadingHTTPServer(('0.0.0.0', 8080), Handler)
     logger.info("HTTP server started on port 8080 (threaded)")
