@@ -763,6 +763,11 @@ def start_http_server(pipeline):
     """Expose pipeline data via a simple HTTP API."""
 
     class Handler(BaseHTTPRequestHandler):
+        # FIX: must be HTTP/1.1 for Transfer-Encoding: chunked to work.
+        # The default HTTP/1.0 causes chunked frame bytes to be treated as
+        # literal body content, corrupting the downloaded JSON file.
+        protocol_version = 'HTTP/1.1'
+
         def do_GET(self):
             parsed = urlparse(self.path)
             path = parsed.path
@@ -889,14 +894,17 @@ def start_http_server(pipeline):
                     # Chunked transfer terminator
                     self.wfile.write(b'0\r\n\r\n')
 
+                except BrokenPipeError:
+                    # Client disconnected mid-stream — log what was sent so far
+                    # and let handle_one_request swallow the exception cleanly.
+                    logger.warning(f"Export interrupted at row {row_count} (client disconnected) → {filename}")
+                    raise
+                else:
+                    logger.info(f"Export complete: {row_count} rows → {filename}")
                 finally:
-                    # Ensure the generator's DB connection is closed even if
-                    # the client disconnects and BrokenPipeError is raised.
-                    # Exhausting or closing the generator triggers iter_data's
-                    # try/finally which closes the SQLite connection.
+                    # Always close the generator so iter_data's try/finally
+                    # closes the SQLite connection immediately.
                     row_iter.close()
-
-                logger.info(f"Export complete: {row_count} rows → {filename}")
 
             MAX_LIMIT_DATA = 10_000
             MAX_LIMIT_EXPORT = 100_000
