@@ -148,7 +148,7 @@ class SafeSQLiteResearchETL:
 
         # FIX (scale): bumped from 50k to 100k to maintain ~2hr buffer at
         # 12.5 records/sec (5000 locations).
-        self.write_queue = Queue(maxsize=100_000)
+        self.write_queue = Queue(maxsize=300_000)
 
         self._api_fetches = 0
         self._records_queued = 0
@@ -277,10 +277,10 @@ class SafeSQLiteResearchETL:
         Split locations into two independent polling threads by priority.
         Each thread runs a heap-based scheduler for accurate interval timing.
         """
-        # FIX (scale): reduced high stagger from 0.1s to 0.05s to give the
+        # FIX (scale): reduced high stagger from 0.1s to 0.02s to give the
         # high poller more headroom at 2,500 locations (ceiling ~20/sec vs
         # required ~8.3/sec). Configurable via env var for further tuning.
-        high_stagger = float(os.getenv('HIGH_STAGGER', '0.05'))
+        high_stagger = float(os.getenv('HIGH_STAGGER', '0.02'))
         low_stagger = self.stagger_interval
 
         high_group = {
@@ -719,7 +719,7 @@ class SafeSQLiteResearchETL:
         # location throughput — see batch_write_to_db docstring.
         writer_thread = threading.Thread(
             target=self.batch_write_to_db,
-            kwargs={'batch_size': 1000, 'max_wait_seconds': 5},
+            kwargs={'batch_size': 5000, 'max_wait_seconds': 2},
             name='writer',
             daemon=False,
         )
