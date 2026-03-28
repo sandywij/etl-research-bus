@@ -191,12 +191,19 @@ class SafeSQLiteResearchETL:
         logger.info(f"Database initialised at {self.db_path}")
 
     def cleanup_old_data(self):
-        """Delete records older than retention_days, then incrementally reclaim space."""
+        """Delete records older than retention_days during inactive hours only."""
+        tz = zoneinfo.ZoneInfo(self.timezone)
+        now = datetime.now(tz)
+        
+        # Only run cleanup during inactive hours (midnight to 5 AM)
+        if not (now.hour >= 0 and now.hour < 5):
+            logger.debug("Skipping cleanup - not in maintenance window (midnight-5AM)")
+            return
+        
         try:
             conn = sqlite3.connect(self.db_path, timeout=30)
             cursor = conn.cursor()
 
-            tz = zoneinfo.ZoneInfo(self.timezone)
             cutoff = datetime.now(tz) - timedelta(days=self.retention_days)
             cutoff_str = _iso8601_tz(cutoff.strftime('%Y-%m-%dT%H:%M:%S%z'))
 
@@ -210,15 +217,10 @@ class SafeSQLiteResearchETL:
 
             if deleted > 0:
                 logger.info(f"Deleted {deleted} old records")
-                # Only vacuum during inactive hours (midnight to 5 AM)
-                now = datetime.now(tz)
-                if now.hour >= 0 and now.hour < 5:
-                    logger.info("Running VACUUM during inactive hours")
-                    cursor.execute('PRAGMA incremental_vacuum')
-                    conn.commit()
-                    logger.info("Incremental vacuum complete")
-                else:
-                    logger.info("Skipping VACUUM - not in maintenance window (midnight-5AM)")
+                logger.info("Running VACUUM during maintenance window")
+                cursor.execute('PRAGMA incremental_vacuum')
+                conn.commit()
+                logger.info("Incremental vacuum complete")
             else:
                 logger.info("No records to delete")
 
