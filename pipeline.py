@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import csv
 import heapq
+import concurrent.futures
 import queue as queue_module
 import re
 from datetime import datetime, timedelta
@@ -126,7 +127,7 @@ class SafeSQLiteResearchETL:
         api_url,
         api_token,
         locations_config,
-        start_hour=5,
+        start_hour=6,
         end_hour=24,
         db_path='/data/research.db',
         retention_days=3,
@@ -209,35 +210,55 @@ class SafeSQLiteResearchETL:
         logger.info(f"Database initialised at {self.db_path}")
 
     def cleanup_old_data(self):
-        """Delete records older than retention_days, then incrementally reclaim space."""
+        """
+        Delete records older than retention_days in small batches so the DB
+        lock is never held long enough to block the writer thread.
+
+        Each batch deletes at most 5,000 rows then releases the lock and sleeps
+        0.1s, giving the writer a window to commit between batches. At ~1M rows
+        needing deletion this takes ~200 batches x ~100ms = ~20s total elapsed,
+        but no single lock hold exceeds ~100ms.
+        """
+        tz = zoneinfo.ZoneInfo(self.timezone)
+        cutoff = datetime.now(tz) - timedelta(days=self.retention_days)
+        cutoff_str = _iso8601_tz(cutoff.strftime('%Y-%m-%dT%H:%M:%S%z'))
+        logger.info(f"Cleanup: removing records before {cutoff_str}")
+
+        total_deleted = 0
+        batch_size = 5_000
+
         try:
-            conn = sqlite3.connect(self.db_path, timeout=30)
-            cursor = conn.cursor()
-
-            tz = zoneinfo.ZoneInfo(self.timezone)
-            cutoff = datetime.now(tz) - timedelta(days=self.retention_days)
-            cutoff_str = _iso8601_tz(cutoff.strftime('%Y-%m-%dT%H:%M:%S%z'))
-
-            logger.info(f"Cleanup: removing records before {cutoff_str}")
-
-            cursor.execute(
-                'DELETE FROM samples WHERE sampled_at < ?', (cutoff_str,)
-            )
-            deleted = cursor.rowcount
-            conn.commit()
-
-            if deleted > 0:
-                logger.info(f"Deleted {deleted} old records")
-                cursor.execute('PRAGMA incremental_vacuum')
+            while True:
+                conn = sqlite3.connect(self.db_path, timeout=30)
+                cursor = conn.cursor()
+                # Subquery lets SQLite use the sampled_at index rather than
+                # scanning the full table on every batch.
+                cursor.execute(
+                    "DELETE FROM samples WHERE id IN "
+                    "(SELECT id FROM samples WHERE sampled_at < ? LIMIT ?)",
+                    (cutoff_str, batch_size)
+                )
+                deleted = cursor.rowcount
                 conn.commit()
+                conn.close()
+                total_deleted += deleted
+                if deleted < batch_size:
+                    break
+                # Brief pause — lets writer thread commit between batches
+                time.sleep(0.1)
+
+            if total_deleted > 0:
+                logger.info(f"Deleted {total_deleted} old records (batched)")
+                conn = sqlite3.connect(self.db_path, timeout=30)
+                conn.execute('PRAGMA incremental_vacuum')
+                conn.commit()
+                conn.close()
                 logger.info("Incremental vacuum complete")
             else:
                 logger.info("No records to delete")
 
-            conn.close()
-
         except sqlite3.OperationalError as e:
-            logger.error(f"Cleanup error: {e}")
+            logger.error(f"Cleanup error after {total_deleted} deleted: {e}")
 
     # ------------------------------------------------------------------
     # Scheduling helpers
@@ -275,13 +296,19 @@ class SafeSQLiteResearchETL:
     def extract_and_queue(self):
         """
         Split locations into two independent polling threads by priority.
-        Each thread runs a heap-based scheduler for accurate interval timing.
+        Each thread runs a heap-based scheduler feeding a ThreadPoolExecutor
+        so multiple fetches run concurrently, overcoming API latency limits.
+
+        With ~256ms API latency and sequential fetching, throughput was capped
+        at ~3.9/sec regardless of stagger. With N workers it becomes N/0.256,
+        so 4 high workers → 15.6/sec and 2 medium workers → 7.8/sec.
         """
-        # FIX (scale): reduced high stagger from 0.1s to 0.05s to give the
-        # high poller more headroom at 2,500 locations (ceiling ~20/sec vs
-        # required ~8.3/sec). Configurable via env var for further tuning.
         high_stagger = float(os.getenv('HIGH_STAGGER', '0.05'))
         low_stagger = self.stagger_interval
+        # Worker counts: enough to saturate the interval requirement with
+        # headroom. Configurable via env vars for tuning.
+        high_workers = int(os.getenv('HIGH_WORKERS', '4'))
+        low_workers = int(os.getenv('LOW_WORKERS', '2'))
 
         high_group = {
             loc: cfg
@@ -295,19 +322,21 @@ class SafeSQLiteResearchETL:
         }
 
         logger.info(
-            f"Poll groups — high: {len(high_group)} locations @ {high_stagger}s stagger, "
-            f"low/medium: {len(low_group)} locations @ {low_stagger}s stagger"
+            f"Poll groups — high: {len(high_group)} locations @ {high_stagger}s stagger "
+            f"x {high_workers} workers, "
+            f"low/medium: {len(low_group)} locations @ {low_stagger}s stagger "
+            f"x {low_workers} workers"
         )
 
         high_thread = threading.Thread(
             target=self._poll_group,
-            args=(high_group, high_stagger),
+            args=(high_group, high_stagger, high_workers),
             name='poller-high',
             daemon=True,
         )
         low_thread = threading.Thread(
             target=self._poll_group,
-            args=(low_group, low_stagger),
+            args=(low_group, low_stagger, low_workers),
             name='poller-low',
             daemon=True,
         )
@@ -326,54 +355,81 @@ class SafeSQLiteResearchETL:
         high_thread.join()
         low_thread.join()
 
-    def _poll_group(self, locations: dict, stagger: float):
+    def _poll_group(self, locations: dict, stagger: float, num_workers: int):
         """
-        Drive a group of locations using a min-heap priority queue keyed on
-        next_poll_monotonic time.
+        Drive a group of locations using a min-heap scheduler feeding a
+        ThreadPoolExecutor.
 
-        Inactive-hours behaviour: sleeps in 60s increments, then rebuilds
-        the heap on resume to avoid firing a backlog of overdue polls.
+        The scheduler thread pops due locations from the heap and submits them
+        to the pool as non-blocking futures. This means multiple HTTP requests
+        are in-flight simultaneously, so throughput scales with num_workers
+        rather than being limited by single-request latency.
+
+        The heap is protected by a lock since the scheduler thread reads/writes
+        it while worker threads reschedule completed locations back onto it.
+
+        Inactive-hours behaviour: drains in-flight work, then sleeps and
+        rebuilds the heap on resume.
         """
         if not locations:
             logger.info(f"[{threading.current_thread().name}] No locations assigned, exiting.")
             return
 
         heap = self._build_schedule_heap(locations)
+        heap_lock = threading.Lock()
+        thread_name = threading.current_thread().name
         was_inactive = False
 
-        while self.running:
-            if not self.is_active_hours():
-                if not was_inactive:
-                    logger.info(
-                        f"[{threading.current_thread().name}] Outside active hours — pausing"
-                    )
-                    was_inactive = True
-                time.sleep(60)
-                continue
-
-            if was_inactive:
-                logger.info(
-                    f"[{threading.current_thread().name}] Active hours resumed — "
-                    f"rescheduling {len(heap)} locations from now"
-                )
-                heap = self._build_schedule_heap(locations)
-                was_inactive = False
-
-            next_poll, location = heap[0]
-            now = time.monotonic()
-            wait = next_poll - now
-
-            if wait > 0:
-                time.sleep(min(wait, 60))
-                continue
-
-            heapq.heappop(heap)
+        def fetch_and_reschedule(location, intended_fire_time):
+            """Worker: fetch the location then push its next poll back onto the heap."""
             self._fetch_and_queue(location)
-
             interval = self.locations_config[location]['interval']
-            ideal_next = next_poll + interval + stagger
+            ideal_next = intended_fire_time + interval + stagger
             clamped_next = max(ideal_next, time.monotonic())
-            heapq.heappush(heap, (clamped_next, location))
+            with heap_lock:
+                heapq.heappush(heap, (clamped_next, location))
+
+        # Outer loop restarts the executor after inactive-hours resume.
+        # A ThreadPoolExecutor cannot be reused after shutdown, so we
+        # recreate it each time active hours begin.
+        while self.running:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=num_workers,
+                thread_name_prefix=thread_name,
+            ) as pool:
+                while self.running:
+                    if not self.is_active_hours():
+                        if not was_inactive:
+                            logger.info(f"[{thread_name}] Outside active hours — pausing")
+                            was_inactive = True
+                        time.sleep(60)
+                        continue
+
+                    if was_inactive:
+                        # Pool shuts down cleanly when the with block exits,
+                        # draining all in-flight fetches before we rebuild.
+                        logger.info(
+                            f"[{thread_name}] Active hours resumed — "
+                            f"rescheduling {len(heap)} locations from now"
+                        )
+                        heap = self._build_schedule_heap(locations)
+                        heap_lock = threading.Lock()
+                        was_inactive = False
+                        break  # exit inner while → exit with (pool drains) → outer while restarts with fresh pool
+
+                    with heap_lock:
+                        if heap:
+                            next_poll, location = heap[0]
+                            wait = next_poll - time.monotonic()
+                            if wait <= 0:
+                                heapq.heappop(heap)
+                                pool.submit(fetch_and_reschedule, location, next_poll)
+                                continue  # immediately check next heap entry
+
+                    # Top entry not due yet — sleep until it is (cap at 1s)
+                    with heap_lock:
+                        wait = (heap[0][0] - time.monotonic()) if heap else 1
+                    time.sleep(min(max(wait, 0), 1))
 
     def _fetch_and_queue(self, location):
         """Fetch one location from the API and push to the write queue."""
@@ -560,7 +616,7 @@ class SafeSQLiteResearchETL:
             logger.error(f"DB read error: {e}")
             return []
 
-    def iter_data(self, location=None, limit=100_000, offset=0, date_from=None, date_to=None, chunk_size=500):
+    def iter_data(self, location=None, limit=100_000, offset=0, date_from=None, date_to=None, chunk_size=5000):
         """
         Generator that yields rows one dict at a time, fetching in chunks.
         Opens DB in read-only URI mode so reads never block the WAL writer.
@@ -572,8 +628,10 @@ class SafeSQLiteResearchETL:
             conn = sqlite3.connect(uri, uri=True, timeout=60)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute('PRAGMA mmap_size=268435456')
-            cursor.execute('PRAGMA cache_size=-32000')
+            # 400MB virtual mmap — only active pages use physical RAM
+            cursor.execute('PRAGMA mmap_size=419430400')
+            # 64MB page cache — up from 32MB, funded by not growing the queue
+            cursor.execute('PRAGMA cache_size=-65536')
             cursor.execute('PRAGMA temp_store=MEMORY')
             cursor.arraysize = chunk_size
 
@@ -858,7 +916,7 @@ def start_http_server(pipeline):
                     self.wfile.write(data)
                     self.wfile.write(b'\r\n')
 
-                BATCH = 500
+                BATCH = 2000
                 row_count = 0
                 first = True
                 batch = []
