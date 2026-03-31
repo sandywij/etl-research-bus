@@ -307,8 +307,8 @@ class SafeSQLiteResearchETL:
         low_stagger = self.stagger_interval
         # Worker counts: enough to saturate the interval requirement with
         # headroom. Configurable via env vars for tuning.
-        high_workers = int(os.getenv('HIGH_WORKERS', '4'))
-        low_workers = int(os.getenv('LOW_WORKERS', '2'))
+        high_workers = int(os.getenv('HIGH_WORKERS', '8'))
+        low_workers = int(os.getenv('LOW_WORKERS', '4'))
 
         high_group = {
             loc: cfg
@@ -384,7 +384,7 @@ class SafeSQLiteResearchETL:
             """Worker: fetch the location then push its next poll back onto the heap."""
             self._fetch_and_queue(location)
             interval = self.locations_config[location]['interval']
-            ideal_next = intended_fire_time + interval + stagger
+            ideal_next = intended_fire_time + interval
             clamped_next = max(ideal_next, time.monotonic())
             with heap_lock:
                 heapq.heappush(heap, (clamped_next, location))
@@ -452,12 +452,13 @@ class SafeSQLiteResearchETL:
                 'data': json.dumps(data),
                 'sampled_at': sampled_at,
             }
+            
 
             with self._records_lock:
                 self._api_fetches += 1
 
             try:
-                self.write_queue.put_nowait(record)
+                self.write_queue.put(record, timeout=5)
                 with self._records_lock:
                     self._records_queued += 1
             except queue_module.Full:
