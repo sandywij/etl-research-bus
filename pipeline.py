@@ -181,7 +181,7 @@ class SafeSQLiteResearchETL:
         cursor = conn.cursor()
 
         cursor.execute('PRAGMA journal_mode=WAL')
-        cursor.execute('PRAGMA busy_timeout=5000')
+        cursor.execute('PRAGMA busy_timeout=15000')
         cursor.execute('PRAGMA auto_vacuum=INCREMENTAL')
 
         cursor.execute('''
@@ -225,7 +225,7 @@ class SafeSQLiteResearchETL:
         logger.info(f"Cleanup: removing records before {cutoff_str}")
 
         total_deleted = 0
-        batch_size = 5_000
+        batch_size = 1_000
 
         try:
             while True:
@@ -800,7 +800,7 @@ class SafeSQLiteResearchETL:
                 )
             else:
                 logger.info("Queue empty — waiting for writer thread to exit...")
-            writer_thread.join(timeout=30)
+            writer_thread.join(timeout=60)
             if writer_thread.is_alive():
                 logger.warning(
                     "Writer thread did not finish within 30s — some records may not have been written. "
