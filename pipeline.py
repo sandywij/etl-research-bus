@@ -147,8 +147,6 @@ class SafeSQLiteResearchETL:
         self.stagger_interval = stagger_interval
         self.timezone = timezone
 
-        # FIX (scale): bumped from 50k to 100k to maintain ~2hr buffer at
-        # 12.5 records/sec (5000 locations).
         self.write_queue = Queue(maxsize=100_000)
 
         self._api_fetches = 0
@@ -181,8 +179,9 @@ class SafeSQLiteResearchETL:
         cursor = conn.cursor()
 
         cursor.execute('PRAGMA journal_mode=WAL')
-        cursor.execute('PRAGMA busy_timeout=15000')
-        cursor.execute('PRAGMA auto_vacuum=INCREMENTAL')
+        cursor.execute('PRAGMA synchronous=NORMAL') # Faster, safer for WAL
+        cursor.execute('PRAGMA wal_autocheckpoint=100') # Checkpoint every 100 pages instead of 1000
+        cursor.execute('PRAGMA busy_timeout=30000')
 
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS samples (
@@ -213,11 +212,6 @@ class SafeSQLiteResearchETL:
         """
         Delete records older than retention_days in small batches so the DB
         lock is never held long enough to block the writer thread.
-
-        Each batch deletes at most 5,000 rows then releases the lock and sleeps
-        0.1s, giving the writer a window to commit between batches. At ~1M rows
-        needing deletion this takes ~200 batches x ~100ms = ~20s total elapsed,
-        but no single lock hold exceeds ~100ms.
         """
         tz = zoneinfo.ZoneInfo(self.timezone)
         cutoff = datetime.now(tz) - timedelta(days=self.retention_days)
@@ -231,8 +225,6 @@ class SafeSQLiteResearchETL:
             while True:
                 conn = sqlite3.connect(self.db_path, timeout=30)
                 cursor = conn.cursor()
-                # Subquery lets SQLite use the sampled_at index rather than
-                # scanning the full table on every batch.
                 cursor.execute(
                     "DELETE FROM samples WHERE id IN "
                     "(SELECT id FROM samples WHERE sampled_at < ? LIMIT ?)",
@@ -244,7 +236,6 @@ class SafeSQLiteResearchETL:
                 total_deleted += deleted
                 if deleted < batch_size:
                     break
-                # Brief pause — lets writer thread commit between batches
                 time.sleep(0.1)
 
             if total_deleted > 0:
@@ -270,13 +261,7 @@ class SafeSQLiteResearchETL:
         return self.start_hour <= now.hour < self.end_hour
 
     def _build_schedule_heap(self, locations: dict) -> list:
-        """
-        Build an initial min-heap of (next_poll_monotonic, location) entries.
-
-        Locations are staggered evenly across one full interval window so
-        startup doesn't fire all requests simultaneously. Uses time.monotonic()
-        as the key — immune to clock adjustments and never goes backwards.
-        """
+        """Build an initial min-heap of (next_poll_monotonic, location) entries."""
         heap = []
         location_list = list(locations.keys())
         n = len(location_list)
@@ -294,19 +279,9 @@ class SafeSQLiteResearchETL:
     # ------------------------------------------------------------------
 
     def extract_and_queue(self):
-        """
-        Split locations into two independent polling threads by priority.
-        Each thread runs a heap-based scheduler feeding a ThreadPoolExecutor
-        so multiple fetches run concurrently, overcoming API latency limits.
-
-        With ~256ms API latency and sequential fetching, throughput was capped
-        at ~3.9/sec regardless of stagger. With N workers it becomes N/0.256,
-        so 4 high workers → 15.6/sec and 2 medium workers → 7.8/sec.
-        """
+        """Split locations into two independent polling threads by priority."""
         high_stagger = float(os.getenv('HIGH_STAGGER', '0.05'))
         low_stagger = self.stagger_interval
-        # Worker counts: enough to saturate the interval requirement with
-        # headroom. Configurable via env vars for tuning.
         high_workers = int(os.getenv('HIGH_WORKERS', '8'))
         low_workers = int(os.getenv('LOW_WORKERS', '4'))
 
@@ -356,21 +331,7 @@ class SafeSQLiteResearchETL:
         low_thread.join()
 
     def _poll_group(self, locations: dict, stagger: float, num_workers: int):
-        """
-        Drive a group of locations using a min-heap scheduler feeding a
-        ThreadPoolExecutor.
-
-        The scheduler thread pops due locations from the heap and submits them
-        to the pool as non-blocking futures. This means multiple HTTP requests
-        are in-flight simultaneously, so throughput scales with num_workers
-        rather than being limited by single-request latency.
-
-        The heap is protected by a lock since the scheduler thread reads/writes
-        it while worker threads reschedule completed locations back onto it.
-
-        Inactive-hours behaviour: drains in-flight work, then sleeps and
-        rebuilds the heap on resume.
-        """
+        """Drive a group of locations using a min-heap scheduler feeding a ThreadPoolExecutor."""
         if not locations:
             logger.info(f"[{threading.current_thread().name}] No locations assigned, exiting.")
             return
@@ -381,17 +342,14 @@ class SafeSQLiteResearchETL:
         was_inactive = False
 
         def fetch_and_reschedule(location, intended_fire_time):
-            """Worker: fetch the location then push its next poll back onto the heap."""
-            self._fetch_and_queue(location)
             interval = self.locations_config[location]['interval']
             ideal_next = intended_fire_time + interval
+            
             clamped_next = max(ideal_next, time.monotonic())
             with heap_lock:
                 heapq.heappush(heap, (clamped_next, location))
+            self._fetch_and_queue(location)
 
-        # Outer loop restarts the executor after inactive-hours resume.
-        # A ThreadPoolExecutor cannot be reused after shutdown, so we
-        # recreate it each time active hours begin.
         while self.running:
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=num_workers,
@@ -406,8 +364,6 @@ class SafeSQLiteResearchETL:
                         continue
 
                     if was_inactive:
-                        # Pool shuts down cleanly when the with block exits,
-                        # draining all in-flight fetches before we rebuild.
                         logger.info(
                             f"[{thread_name}] Active hours resumed — "
                             f"rescheduling {len(heap)} locations from now"
@@ -415,7 +371,7 @@ class SafeSQLiteResearchETL:
                         heap = self._build_schedule_heap(locations)
                         heap_lock = threading.Lock()
                         was_inactive = False
-                        break  # exit inner while → exit with (pool drains) → outer while restarts with fresh pool
+                        break
 
                     with heap_lock:
                         if heap:
@@ -424,9 +380,8 @@ class SafeSQLiteResearchETL:
                             if wait <= 0:
                                 heapq.heappop(heap)
                                 pool.submit(fetch_and_reschedule, location, next_poll)
-                                continue  # immediately check next heap entry
+                                continue
 
-                    # Top entry not due yet — sleep until it is (cap at 1s)
                     with heap_lock:
                         wait = (heap[0][0] - time.monotonic()) if heap else 1
                     time.sleep(min(max(wait, 0), 1))
@@ -452,13 +407,12 @@ class SafeSQLiteResearchETL:
                 'data': json.dumps(data),
                 'sampled_at': sampled_at,
             }
-            
 
             with self._records_lock:
                 self._api_fetches += 1
 
             try:
-                self.write_queue.put(record, timeout=5)
+                self.write_queue.put(record, timeout=0.5)
                 with self._records_lock:
                     self._records_queued += 1
             except queue_module.Full:
@@ -503,15 +457,8 @@ class SafeSQLiteResearchETL:
     # Writer thread
     # ------------------------------------------------------------------
 
-    def batch_write_to_db(self, batch_size=1000, max_wait_seconds=5):
-        """
-        Dynamic batching — commit when we hit batch_size OR max_wait_seconds.
-
-        FIX (scale): defaults raised from (500, 2s) to (1000, 5s). At 12.5
-        rec/sec the old defaults produced ~25 records per commit (always hitting
-        the time trigger). New defaults yield batches of ~60 records at steady
-        state — still well within latency budget and ~2.5x fewer commits/min.
-        """
+    def batch_write_to_db(self, batch_size=100, max_wait_seconds=5):
+        """Dynamic batching — commit when we hit batch_size OR max_wait_seconds."""
         while self.running or not self.write_queue.empty():
             batch = []
             deadline = time.monotonic() + max_wait_seconds
@@ -595,7 +542,7 @@ class SafeSQLiteResearchETL:
         return where, args
 
     def get_data(self, location=None, limit=100, offset=0, date_from=None, date_to=None):
-        """Query the samples table with optional filters. Returns a list (for small /data requests)."""
+        """Query the samples table with optional filters."""
         try:
             conn = sqlite3.connect(self.db_path, timeout=60)
             conn.row_factory = sqlite3.Row
@@ -621,23 +568,28 @@ class SafeSQLiteResearchETL:
         """
         Generator that yields rows one dict at a time, fetching in chunks.
         Opens DB in read-only URI mode so reads never block the WAL writer.
-        Connection is always closed via try/finally even if caller breaks early.
         """
         conn = None
         try:
-            uri = f'file:{self.db_path}?mode=ro'
-            conn = sqlite3.connect(uri, uri=True, timeout=60)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            # 400MB virtual mmap — only active pages use physical RAM
+            cursor.execute('PRAGMA query_only=ON')
             cursor.execute('PRAGMA mmap_size=419430400')
-            # 64MB page cache — up from 32MB, funded by not growing the queue
             cursor.execute('PRAGMA cache_size=-65536')
             cursor.execute('PRAGMA temp_store=MEMORY')
             cursor.arraysize = chunk_size
 
             where, args = self._build_query(location, date_from, date_to)
             args += [limit, offset]
+
+            count_args = args[:-2]  # strip limit/offset
+            cursor.execute(
+                f'SELECT COUNT(*) FROM samples {where}',
+                count_args,
+            )
+            total = cursor.fetchone()[0]
+            logger.info(f"iter_data: {total} matching rows (limit={args[-2]}, offset={args[-1]})")
 
             cursor.execute(
                 f'SELECT * FROM samples {where} ORDER BY sampled_at DESC LIMIT ? OFFSET ?',
@@ -658,14 +610,7 @@ class SafeSQLiteResearchETL:
                 conn.close()
 
     def get_stats(self):
-        """
-        Return pipeline and database statistics.
-
-        FIX (scale): by_location GROUP BY removed from the default response —
-        at 2.5M rows steady state it scans the full table and takes several
-        seconds, holding a read lock during active writes. Use /stats/locations
-        for per-location detail when needed.
-        """
+        """Return pipeline and database statistics."""
         try:
             conn = sqlite3.connect(self.db_path, timeout=30)
             cursor = conn.cursor()
@@ -712,11 +657,7 @@ class SafeSQLiteResearchETL:
             return {}
 
     def get_location_stats(self):
-        """
-        Return per-location record counts and sample times.
-        Separated from get_stats because the GROUP BY is expensive at scale
-        (~2.5M rows, 5000 locations). Call via /stats/locations only when needed.
-        """
+        """Return per-location record counts and sample times."""
         try:
             conn = sqlite3.connect(self.db_path, timeout=60)
             cursor = conn.cursor()
@@ -774,11 +715,9 @@ class SafeSQLiteResearchETL:
         logger.info(f"Est. daily API calls: {total_daily:,}")
         logger.info("=== Pipeline ready ===\n")
 
-        # FIX (scale): batch_size and max_wait_seconds raised to match 5k
-        # location throughput — see batch_write_to_db docstring.
         writer_thread = threading.Thread(
             target=self.batch_write_to_db,
-            kwargs={'batch_size': 1000, 'max_wait_seconds': 5},
+            kwargs={'batch_size': 100, 'max_wait_seconds': 1},
             name='writer',
             daemon=False,
         )
@@ -796,14 +735,14 @@ class SafeSQLiteResearchETL:
             if remaining:
                 logger.info(
                     f"Waiting for writer thread to flush {remaining} remaining records "
-                    f"(timeout=30s)..."
+                    f"(timeout=60s)..."
                 )
             else:
                 logger.info("Queue empty — waiting for writer thread to exit...")
             writer_thread.join(timeout=60)
             if writer_thread.is_alive():
                 logger.warning(
-                    "Writer thread did not finish within 30s — some records may not have been written. "
+                    "Writer thread did not finish within 60s — some records may not have been written. "
                     "Check the overflow file."
                 )
             else:
@@ -822,9 +761,6 @@ def start_http_server(pipeline):
     """Expose pipeline data via a simple HTTP API."""
 
     class Handler(BaseHTTPRequestHandler):
-        # FIX: must be HTTP/1.1 for Transfer-Encoding: chunked to work.
-        # The default HTTP/1.0 causes chunked frame bytes to be treated as
-        # literal body content, corrupting the downloaded JSON file.
         protocol_version = 'HTTP/1.1'
 
         def do_GET(self):
@@ -896,13 +832,19 @@ def start_http_server(pipeline):
 
             def stream_export(row_iter, filename):
                 """
-                Stream a JSON array to the client in batches of 500 rows per
-                write to reduce syscalls.
+                Stream a JSON array to the client using chunked transfer encoding.
 
-                FIX: correctly handles empty results (writes '[]' not just ']').
-                FIX: explicit try/finally ensures the iter_data DB connection is
-                closed immediately if the client disconnects mid-stream, rather
-                than waiting for garbage collection.
+                Builds the array incrementally:
+                  - Opens with '['
+                  - Serialises rows in batches, joining with ','
+                  - Inserts the inter-batch ',' as a separate chunk so batch
+                    boundaries never corrupt the JSON structure
+                  - Closes with ']'
+                  - Writes the chunked-transfer terminator (0-length chunk)
+
+                The DB connection held by iter_data is released immediately via
+                row_iter.close() in the finally block, even if the client
+                disconnects mid-stream.
                 """
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
@@ -919,50 +861,53 @@ def start_http_server(pipeline):
 
                 BATCH = 2000
                 row_count = 0
-                first = True
+                first_batch = True
                 batch = []
 
-                def flush(batch, first):
-                    # First batch opens the array; subsequent batches add a
-                    # comma separator before the first element of the batch.
-                    prefix = b'[' if first else b','
-                    write_chunk(prefix + b','.join(
-                        json.dumps(r).encode() for r in batch
-                    ))
+                def flush_batch(batch):
+                    """
+                    Emit one batch row by row.
+                    - First record opens the array with '['
+                    - Every subsequent record is preceded by ','
+                    Each record is written as its own chunk to avoid building
+                    a large in-memory bytes object.
+                    """
+                    nonlocal first_batch
+                    for record in batch:
+                        encoded = json.dumps(record).encode()
+                        if first_batch:
+                            write_chunk(b'[' + encoded)
+                            first_batch = False
+                        else:
+                            write_chunk(b',' + encoded)
 
                 try:
                     for row in row_iter:
                         batch.append(row)
                         row_count += 1
                         if len(batch) >= BATCH:
-                            flush(batch, first)
-                            first = False
+                            flush_batch(batch)
                             batch = []
 
                     # Flush any remaining rows
                     if batch:
-                        flush(batch, first)
-                        first = False
+                        flush_batch(batch)
 
-                    # FIX: if no rows were yielded at all, first is still True
-                    # and we must open the array ourselves before closing it.
-                    if first:
+                    # No rows at all — open the array before closing it
+                    if first_batch:
                         write_chunk(b'[')
 
                     write_chunk(b']')
-                    # Chunked transfer terminator
                     self.wfile.write(b'0\r\n\r\n')
 
                 except BrokenPipeError:
-                    # Client disconnected mid-stream — log what was sent so far
-                    # and let handle_one_request swallow the exception cleanly.
-                    logger.warning(f"Export interrupted at row {row_count} (client disconnected) → {filename}")
+                    logger.warning(
+                        f"Export interrupted at row {row_count} (client disconnected) → {filename}"
+                    )
                     raise
                 else:
                     logger.info(f"Export complete: {row_count} rows → {filename}")
                 finally:
-                    # Always close the generator so iter_data's try/finally
-                    # closes the SQLite connection immediately.
                     row_iter.close()
 
             MAX_LIMIT_DATA = 10_000
@@ -1000,8 +945,6 @@ def start_http_server(pipeline):
                 send_data(pipeline.get_stats())
 
             elif path == '/stats/locations':
-                # FIX (scale): expensive GROUP BY query separated from /stats
-                # so the fast summary endpoint isn't affected.
                 send_data(pipeline.get_location_stats())
 
             elif path == '/export':
