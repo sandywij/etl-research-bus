@@ -179,9 +179,8 @@ class SafeSQLiteResearchETL:
         cursor = conn.cursor()
 
         cursor.execute('PRAGMA journal_mode=WAL')
-        cursor.execute('PRAGMA synchronous=NORMAL') # Faster, safer for WAL
-        cursor.execute('PRAGMA wal_autocheckpoint=100') # Checkpoint every 100 pages instead of 1000
-        cursor.execute('PRAGMA busy_timeout=30000')
+        cursor.execute('PRAGMA busy_timeout=15000')
+        cursor.execute('PRAGMA auto_vacuum=INCREMENTAL')
 
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS samples (
@@ -342,13 +341,12 @@ class SafeSQLiteResearchETL:
         was_inactive = False
 
         def fetch_and_reschedule(location, intended_fire_time):
+            self._fetch_and_queue(location)
             interval = self.locations_config[location]['interval']
             ideal_next = intended_fire_time + interval
-            
             clamped_next = max(ideal_next, time.monotonic())
             with heap_lock:
                 heapq.heappush(heap, (clamped_next, location))
-            self._fetch_and_queue(location)
 
         while self.running:
             with concurrent.futures.ThreadPoolExecutor(
@@ -412,7 +410,7 @@ class SafeSQLiteResearchETL:
                 self._api_fetches += 1
 
             try:
-                self.write_queue.put(record, timeout=0.5)
+                self.write_queue.put(record, timeout=5)
                 with self._records_lock:
                     self._records_queued += 1
             except queue_module.Full:
@@ -457,7 +455,7 @@ class SafeSQLiteResearchETL:
     # Writer thread
     # ------------------------------------------------------------------
 
-    def batch_write_to_db(self, batch_size=100, max_wait_seconds=5):
+    def batch_write_to_db(self, batch_size=1000, max_wait_seconds=5):
         """Dynamic batching — commit when we hit batch_size OR max_wait_seconds."""
         while self.running or not self.write_queue.empty():
             batch = []
@@ -717,7 +715,7 @@ class SafeSQLiteResearchETL:
 
         writer_thread = threading.Thread(
             target=self.batch_write_to_db,
-            kwargs={'batch_size': 100, 'max_wait_seconds': 1},
+            kwargs={'batch_size': 1000, 'max_wait_seconds': 5},
             name='writer',
             daemon=False,
         )
@@ -859,7 +857,7 @@ def start_http_server(pipeline):
                     self.wfile.write(data)
                     self.wfile.write(b'\r\n')
 
-                BATCH = 2000
+                BATCH = 500
                 row_count = 0
                 first_batch = True
                 batch = []
