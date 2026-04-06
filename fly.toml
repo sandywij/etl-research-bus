@@ -1,8 +1,3 @@
-# fly.toml app configuration file generated for research-etl-polling on 2026-02-17T16:49:10+08:00
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
-
 app = 'research-etl-polling'
 primary_region = 'sin'
 
@@ -17,6 +12,7 @@ primary_region = 'sin'
   POLL_INTERVAL = '300'
   START_HOUR = '5'
   TZ = 'Asia/Singapore'
+  HEALTH_PORT = '8081'
 
 [deploy]
   strategy = "immediate"
@@ -26,24 +22,27 @@ primary_region = 'sin'
   destination = '/data'
   initial_size = '10gb'
 
+# Main API/export server
 [http_service]
   internal_port = 8080
   force_https = true
   auto_stop_machines = 'off'
   auto_start_machines = true
   min_machines_running = 1
-  
+
   [http_service.concurrency]
     hard_limit = 25
     soft_limit = 20
 
-  [[http_service.checks]]
+# Dedicated health check server — isolated from export traffic
+[[services]]
+  internal_port = 8081
+  protocol = 'tcp'
+
+  [[services.tcp_checks]]
     interval = '30s'
     timeout = '5s'
     grace_period = '20s'
-    method = 'get'
-    path = '/health'
-    protocol = 'http'
 
 [[vm]]
   size = 'shared-cpu-1x'

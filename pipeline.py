@@ -1,4 +1,5 @@
 import requests
+import requests.adapters
 import json
 import os
 import time
@@ -10,6 +11,7 @@ import heapq
 import concurrent.futures
 import queue as queue_module
 import re
+import io
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -160,10 +162,18 @@ class SafeSQLiteResearchETL:
         self._last_stats_log = time.monotonic()
         self._stats_log_interval = 60  # seconds
 
-        self.headers = {
+        self.session = requests.Session()
+        self.session.headers.update({
             'User-Agent': 'Research-ETL-Pipeline/1.0',
             token_header: api_token,
-        }
+        })
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=1,       # single host (LTA API)
+            pool_maxsize=16,          # > 12 worker threads
+            max_retries=0,            # errors handled in _fetch_and_queue
+        )
+        self.session.mount('https://', adapter)
+        self.session.mount('http://', adapter)
 
         self.setup_database()
 
@@ -387,10 +397,9 @@ class SafeSQLiteResearchETL:
     def _fetch_and_queue(self, location):
         """Fetch one location from the API and push to the write queue."""
         try:
-            response = requests.get(
+            response = self.session.get(
                 self.api_url,
                 params={self.location_param: location},
-                headers=self.headers,
                 timeout=15,
             )
             response.raise_for_status()
@@ -565,14 +574,14 @@ class SafeSQLiteResearchETL:
     def iter_data(self, location=None, limit=100_000, offset=0, date_from=None, date_to=None, chunk_size=5000):
         """
         Generator that yields rows one dict at a time, fetching in chunks.
-        Opens DB in read-only URI mode so reads never block the WAL writer.
+        Uses PRAGMA query_only=ON so reads never block the WAL writer.
         """
         conn = None
         try:
             conn = sqlite3.connect(self.db_path, timeout=60)
+            conn.execute('PRAGMA query_only=ON')
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute('PRAGMA query_only=ON')
             cursor.execute('PRAGMA mmap_size=419430400')
             cursor.execute('PRAGMA cache_size=-65536')
             cursor.execute('PRAGMA temp_store=MEMORY')
@@ -580,14 +589,6 @@ class SafeSQLiteResearchETL:
 
             where, args = self._build_query(location, date_from, date_to)
             args += [limit, offset]
-
-            count_args = args[:-2]  # strip limit/offset
-            cursor.execute(
-                f'SELECT COUNT(*) FROM samples {where}',
-                count_args,
-            )
-            total = cursor.fetchone()[0]
-            logger.info(f"iter_data: {total} matching rows (limit={args[-2]}, offset={args[-1]})")
 
             cursor.execute(
                 f'SELECT * FROM samples {where} ORDER BY sampled_at DESC LIMIT ? OFFSET ?',
@@ -748,11 +749,44 @@ class SafeSQLiteResearchETL:
 
 
 # ------------------------------------------------------------------
-# HTTP server
+# HTTP servers
 # ------------------------------------------------------------------
 
 _SAFE_LOCATION_RE = re.compile(r'^[\w\-]{1,64}$')
 _MISSING = object()
+
+# Export chunk size: number of rows serialised into one HTTP chunk.
+_EXPORT_ROWS_PER_CHUNK = int(os.getenv('EXPORT_ROWS_PER_CHUNK', '500'))
+# Kernel-side write buffer for the export socket (bytes).
+_EXPORT_WRITE_BUFFER = int(os.getenv('EXPORT_WRITE_BUFFER', str(256 * 1024)))
+# Throttle delay (seconds) between export chunks during active hours.
+_EXPORT_ACTIVE_THROTTLE = float(os.getenv('EXPORT_ACTIVE_THROTTLE', '0.05'))
+
+# Limit concurrent exports to 1.
+_export_sem = threading.Semaphore(1)
+
+
+def start_health_server():
+    """Dedicated health check server on port 8081, isolated from main API."""
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+
+        def do_GET(self):
+            body = b'{"status":"ok"}'
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            pass
+
+    port = int(os.getenv('HEALTH_PORT', '8081'))
+    server = ThreadingHTTPServer(('0.0.0.0', port), HealthHandler)
+    logger.info(f"Health server started on port {port}")
+    server.serve_forever()
 
 
 def start_http_server(pipeline):
@@ -830,19 +864,16 @@ def start_http_server(pipeline):
 
             def stream_export(row_iter, filename):
                 """
-                Stream a JSON array to the client using chunked transfer encoding.
+                Stream a JSON array using chunked transfer encoding.
 
-                Builds the array incrementally:
-                  - Opens with '['
-                  - Serialises rows in batches, joining with ','
-                  - Inserts the inter-batch ',' as a separate chunk so batch
-                    boundaries never corrupt the JSON structure
-                  - Closes with ']'
-                  - Writes the chunked-transfer terminator (0-length chunk)
+                Rows are serialised in batches of _EXPORT_ROWS_PER_CHUNK so
+                that each HTTP chunk is a large, contiguous bytes object rather
+                than one tiny chunk per record.  The socket is wrapped in a
+                BufferedWriter (_EXPORT_WRITE_BUFFER bytes) to avoid a syscall
+                per chunk-header write.
 
-                The DB connection held by iter_data is released immediately via
-                row_iter.close() in the finally block, even if the client
-                disconnects mid-stream.
+                During active polling hours, a small sleep is inserted between
+                chunks to avoid starving the writer thread.
                 """
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
@@ -852,51 +883,49 @@ def start_http_server(pipeline):
                 )
                 self.end_headers()
 
-                def write_chunk(data: bytes):
-                    self.wfile.write(f'{len(data):X}\r\n'.encode())
-                    self.wfile.write(data)
-                    self.wfile.write(b'\r\n')
+                buf = self.connection.makefile('wb', buffering=_EXPORT_WRITE_BUFFER)
 
-                BATCH = 500
+                def write_chunk(data: bytes):
+                    buf.write(f'{len(data):X}\r\n'.encode())
+                    buf.write(data)
+                    buf.write(b'\r\n')
+
                 row_count = 0
-                first_batch = True
+                first_row = True
                 batch = []
 
-                def flush_batch(batch):
-                    """
-                    Emit one batch row by row.
-                    - First record opens the array with '['
-                    - Every subsequent record is preceded by ','
-                    Each record is written as its own chunk to avoid building
-                    a large in-memory bytes object.
-                    """
-                    nonlocal first_batch
+                def flush_batch(batch: list):
+                    nonlocal first_row
+                    parts = []
                     for record in batch:
                         encoded = json.dumps(record).encode()
-                        if first_batch:
-                            write_chunk(b'[' + encoded)
-                            first_batch = False
+                        if first_row:
+                            parts.append(b'[' + encoded)
+                            first_row = False
                         else:
-                            write_chunk(b',' + encoded)
+                            parts.append(b',' + encoded)
+                    write_chunk(b''.join(parts))
 
                 try:
                     for row in row_iter:
                         batch.append(row)
                         row_count += 1
-                        if len(batch) >= BATCH:
+                        if len(batch) >= _EXPORT_ROWS_PER_CHUNK:
                             flush_batch(batch)
                             batch = []
+                            # Throttle during active hours to avoid starving writes
+                            if pipeline.is_active_hours() and _EXPORT_ACTIVE_THROTTLE > 0:
+                                time.sleep(_EXPORT_ACTIVE_THROTTLE)
 
-                    # Flush any remaining rows
                     if batch:
                         flush_batch(batch)
 
-                    # No rows at all — open the array before closing it
-                    if first_batch:
+                    if first_row:
                         write_chunk(b'[')
 
                     write_chunk(b']')
-                    self.wfile.write(b'0\r\n\r\n')
+                    buf.write(b'0\r\n\r\n')
+                    buf.flush()
 
                 except BrokenPipeError:
                     logger.warning(
@@ -946,30 +975,41 @@ def start_http_server(pipeline):
                 send_data(pipeline.get_location_stats())
 
             elif path == '/export':
-                raw_loc, ok = require_param('location', default=None)
-                if not ok:
+                # Limit to one concurrent export
+                if not _export_sem.acquire(blocking=False):
+                    self._send_json(
+                        {'error': 'Export already in progress, try again shortly'},
+                        status=429,
+                    )
                     return
-                location, ok = validate_location(raw_loc)
-                if not ok:
-                    return
-                limit_raw, ok = require_param('limit', cast=int, default=10_000)
-                if not ok:
-                    return
-                limit = min(limit_raw, MAX_LIMIT_EXPORT)
-                offset, ok = require_param('offset', cast=int, default=0)
-                if not ok:
-                    return
-                dates = parse_dates()
-                if dates is None:
-                    return
-                date_from, date_to = dates
 
-                safe_loc = re.sub(r'[^\w\-]', '_', location) if location else 'all'
-                row_iter = pipeline.iter_data(
-                    location=location, limit=limit, offset=offset,
-                    date_from=date_from, date_to=date_to,
-                )
-                stream_export(row_iter, filename=f"research_{safe_loc}.json")
+                try:
+                    raw_loc, ok = require_param('location', default=None)
+                    if not ok:
+                        return
+                    location, ok = validate_location(raw_loc)
+                    if not ok:
+                        return
+                    limit_raw, ok = require_param('limit', cast=int, default=10_000)
+                    if not ok:
+                        return
+                    limit = min(limit_raw, MAX_LIMIT_EXPORT)
+                    offset, ok = require_param('offset', cast=int, default=0)
+                    if not ok:
+                        return
+                    dates = parse_dates()
+                    if dates is None:
+                        return
+                    date_from, date_to = dates
+
+                    safe_loc = re.sub(r'[^\w\-]', '_', location) if location else 'all'
+                    row_iter = pipeline.iter_data(
+                        location=location, limit=limit, offset=offset,
+                        date_from=date_from, date_to=date_to,
+                    )
+                    stream_export(row_iter, filename=f"research_{safe_loc}.json")
+                finally:
+                    _export_sem.release()
 
             else:
                 self.send_response(404)
@@ -993,8 +1033,9 @@ def start_http_server(pipeline):
         def log_message(self, format, *args):
             pass
 
-    server = ThreadingHTTPServer(('0.0.0.0', 8080), Handler)
-    logger.info("HTTP server started on port 8080 (threaded)")
+    port = int(os.getenv('API_PORT', '8080'))
+    server = ThreadingHTTPServer(('0.0.0.0', port), Handler)
+    logger.info(f"HTTP API server started on port {port} (threaded)")
     server.serve_forever()
 
 
@@ -1048,6 +1089,13 @@ if __name__ == "__main__":
         timezone=timezone,
     )
 
+    # Dedicated health server — isolated from API/export traffic
+    health_thread = threading.Thread(
+        target=start_health_server, daemon=True
+    )
+    health_thread.start()
+
+    # Main API server
     http_thread = threading.Thread(
         target=start_http_server, args=(pipeline,), daemon=True
     )
